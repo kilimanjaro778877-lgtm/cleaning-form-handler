@@ -30,7 +30,11 @@ TELEGRAM_TOKEN = _required("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _required("TELEGRAM_CHAT_ID")
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
-    "https://kilimanjaro778877-lgtm.github.io",
+    "https://kilimanjaro778877-lgtm.github.io,"
+    "https://clean-clean.com.ua,"
+    "https://www.clean-clean.com.ua,"
+    "http://clean-clean.com.ua,"
+    "http://www.clean-clean.com.ua",
 ).split(",")
 
 
