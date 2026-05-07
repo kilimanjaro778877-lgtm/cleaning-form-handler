@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
@@ -84,7 +84,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 
 def format_message(form: OrderForm) -> str:
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
     lines = [
         "🆕 *Нова заявка з сайту*",
         "",
