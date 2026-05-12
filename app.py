@@ -6,9 +6,12 @@ Clean-Clean form handler — приймає заявки з сайту і шле
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -79,6 +82,50 @@ class OrderForm(BaseModel):
         return cleaned
 
 
+# ── TikTok Events API ───────────────────────────────────────────────────
+TIKTOK_PIXEL_ID = "D81G97JC77U1Q23A8TQ0"
+TIKTOK_ACCESS_TOKEN = "ecdeeab9a07faf969508e5d12d601c1411e7f242"
+TIKTOK_API = "https://business-api.tiktok.com/open_api/v1.3/pixel/track/"
+
+
+async def send_tiktok_event(form: OrderForm, client_ip: str = "") -> None:
+    """Send server-side SubmitForm event to TikTok Events API."""
+    try:
+        # Hash phone for privacy
+        phone_hash = hashlib.sha256(
+            re.sub(r"[^\d]", "", form.phone).encode()
+        ).hexdigest()
+
+        payload = {
+            "pixel_code": TIKTOK_PIXEL_ID,
+            "event": "SubmitForm",
+            "event_id": str(uuid.uuid4()),
+            "timestamp": str(int(time.time())),
+            "context": {
+                "user": {"phone": phone_hash},
+                "ip": client_ip,
+                "page": {"url": form.page or "https://clean-clean.com.ua/"},
+            },
+            "properties": {
+                "content_name": form.service,
+                "content_category": "cleaning",
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                TIKTOK_API,
+                json=payload,
+                headers={"Access-Token": TIKTOK_ACCESS_TOKEN},
+            )
+        if resp.status_code == 200:
+            log.info("TikTok event sent: SubmitForm")
+        else:
+            log.warning("TikTok event failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        log.warning("TikTok event error (non-critical): %s", exc)
+
+
 # ── Telegram ────────────────────────────────────────────────────────────
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
@@ -134,6 +181,13 @@ async def submit_order(form: OrderForm, request: Request) -> dict[str, Any]:
 
     log.info("New order: %s / %s / %s", form.name, form.phone, form.service)
 
+    client_ip = request.client.host if request.client else ""
     text = format_message(form)
-    await send_to_telegram(text)
+
+    # Send Telegram + TikTok server event in parallel
+    import asyncio
+    await asyncio.gather(
+        send_to_telegram(text),
+        send_tiktok_event(form, client_ip),
+    )
     return {"ok": True}
