@@ -83,8 +83,8 @@ class OrderForm(BaseModel):
 
 
 # ── TikTok Events API ───────────────────────────────────────────────────
-TIKTOK_PIXEL_ID = "D81G97JC77U1Q23A8TQ0"
-TIKTOK_ACCESS_TOKEN = "ecdeeab9a07faf969508e5d12d601c1411e7f242"
+TIKTOK_PIXEL_ID = "D81IGJRC77UDUGTVEQ00"
+TIKTOK_ACCESS_TOKEN = "4ba0204dc922087b907eba4d4321f0dda7dd029e"
 TIKTOK_API = "https://business-api.tiktok.com/open_api/v1.3/pixel/track/"
 
 
