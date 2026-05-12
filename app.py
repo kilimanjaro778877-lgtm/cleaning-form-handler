@@ -98,7 +98,7 @@ async def send_tiktok_event(form: OrderForm, client_ip: str = "") -> None:
 
         payload = {
             "pixel_code": TIKTOK_PIXEL_ID,
-            "event": "SubmitForm",
+            "event": "CompleteRegistration",
             "event_id": str(uuid.uuid4()),
             "timestamp": str(int(time.time())),
             "context": {
