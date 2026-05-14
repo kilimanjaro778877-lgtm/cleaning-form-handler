@@ -43,10 +43,10 @@ ALLOWED_ORIGINS = os.environ.get(
     "https://www.clean-clean.com.ua,"
     "http://clean-clean.com.ua,"
     "http://www.clean-clean.com.ua,"
-    "https://chistotak.com.ua,"
-    "https://www.chistotak.com.ua,"
-    "http://chistotak.com.ua,"
-    "http://www.chistotak.com.ua,"
+    "https://chisto-tak.com.ua,"
+    "https://www.chisto-tak.com.ua,"
+    "http://chisto-tak.com.ua,"
+    "http://www.chisto-tak.com.ua,"
     "https://kilimanjaro778877-lgtm.github.io/chistotak-site",
 ).split(",")
 
