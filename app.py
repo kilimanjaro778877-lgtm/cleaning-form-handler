@@ -31,13 +31,23 @@ def _required(name: str) -> str:
 
 TELEGRAM_TOKEN = _required("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _required("TELEGRAM_CHAT_ID")
+
+# ЧистоТак
+CHISTOTAK_BOT_TOKEN = os.environ.get("CHISTOTAK_BOT_TOKEN", "8924613073:AAFBmEgr3uWb72VOXmWj8S4rR7rJDc7SBfo")
+CHISTOTAK_CHAT_ID   = os.environ.get("CHISTOTAK_CHAT_ID",   "1003760194653")
+
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://kilimanjaro778877-lgtm.github.io,"
     "https://clean-clean.com.ua,"
     "https://www.clean-clean.com.ua,"
     "http://clean-clean.com.ua,"
-    "http://www.clean-clean.com.ua",
+    "http://www.clean-clean.com.ua,"
+    "https://chistotak.com.ua,"
+    "https://www.chistotak.com.ua,"
+    "http://chistotak.com.ua,"
+    "http://www.chistotak.com.ua,"
+    "https://kilimanjaro778877-lgtm.github.io/chistotak-site",
 ).split(",")
 
 
@@ -161,6 +171,41 @@ async def send_to_telegram(text: str) -> None:
         raise HTTPException(status_code=502, detail="telegram_unavailable")
 
 
+# ── ЧистоТак Telegram ───────────────────────────────────────────────────
+CHISTOTAK_API = f"https://api.telegram.org/bot{CHISTOTAK_BOT_TOKEN}/sendMessage"
+
+
+def format_chistotak_message(form: OrderForm) -> str:
+    now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    lines = [
+        "🆕 *Нова заявка — ЧистоТак*",
+        "",
+        f"👤 *Імʼя:* {form.name}",
+        f"📞 *Телефон:* `{form.phone}`",
+        f"🏙 *Місто:* {form.city}",
+        f"🧹 *Послуга:* {form.service}",
+    ]
+    if form.details:
+        lines.append(f"📝 *Деталі:* {form.details}")
+    if form.page:
+        lines.append(f"🔗 *Сторінка:* {form.page}")
+    lines.append(f"🕐 *Час:* {now}")
+    return "\n".join(lines)
+
+
+async def send_to_chistotak_telegram(text: str) -> None:
+    payload = {
+        "chat_id": CHISTOTAK_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(CHISTOTAK_API, json=payload)
+    if resp.status_code != 200:
+        log.error("ЧистоТак Telegram error: %s %s", resp.status_code, resp.text)
+        raise HTTPException(status_code=502, detail="telegram_unavailable")
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root() -> dict[str, str]:
@@ -190,4 +235,15 @@ async def submit_order(form: OrderForm, request: Request) -> dict[str, Any]:
         send_to_telegram(text),
         send_tiktok_event(form, client_ip),
     )
+    return {"ok": True}
+
+
+@app.post("/api/chistotak-order")
+async def submit_chistotak_order(form: OrderForm, request: Request) -> dict[str, Any]:
+    if form.website:
+        return {"ok": True}
+
+    log.info("ЧистоТак order: %s / %s / %s", form.name, form.phone, form.service)
+    text = format_chistotak_message(form)
+    await send_to_chistotak_telegram(text)
     return {"ok": True}
