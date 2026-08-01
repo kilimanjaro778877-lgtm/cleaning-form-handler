@@ -32,10 +32,6 @@ def _required(name: str) -> str:
 TELEGRAM_TOKEN = _required("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _required("TELEGRAM_CHAT_ID")
 
-# ЧистоТак
-CHISTOTAK_BOT_TOKEN = os.environ.get("CHISTOTAK_BOT_TOKEN", "8924613073:AAFBmEgr3uWb72VOXmWj8S4rR7rJDc7SBfo")
-CHISTOTAK_CHAT_ID   = os.environ.get("CHISTOTAK_CHAT_ID",   "1003760194653")
-
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://kilimanjaro778877-lgtm.github.io,"
@@ -171,10 +167,7 @@ async def send_to_telegram(text: str) -> None:
         raise HTTPException(status_code=502, detail="telegram_unavailable")
 
 
-# ── ЧистоТак Telegram ───────────────────────────────────────────────────
-CHISTOTAK_API = f"https://api.telegram.org/bot{CHISTOTAK_BOT_TOKEN}/sendMessage"
-
-
+# ── ЧистоТак (шле в той самий Telegram, що й Clean-Clean) ───────────────
 def format_chistotak_message(form: OrderForm) -> str:
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
     lines = [
@@ -191,19 +184,6 @@ def format_chistotak_message(form: OrderForm) -> str:
         lines.append(f"🔗 *Сторінка:* {form.page}")
     lines.append(f"🕐 *Час:* {now}")
     return "\n".join(lines)
-
-
-async def send_to_chistotak_telegram(text: str) -> None:
-    payload = {
-        "chat_id": CHISTOTAK_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(CHISTOTAK_API, json=payload)
-    if resp.status_code != 200:
-        log.error("ЧистоТак Telegram error: %s %s", resp.status_code, resp.text)
-        raise HTTPException(status_code=502, detail="telegram_unavailable")
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────
@@ -245,5 +225,5 @@ async def submit_chistotak_order(form: OrderForm, request: Request) -> dict[str,
 
     log.info("ЧистоТак order: %s / %s / %s", form.name, form.phone, form.service)
     text = format_chistotak_message(form)
-    await send_to_chistotak_telegram(text)
+    await send_to_telegram(text)
     return {"ok": True}
