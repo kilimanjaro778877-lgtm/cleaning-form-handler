@@ -466,14 +466,23 @@ async def telegram_webhook(
         parent_id = msg["reply_to_message"].get("message_id")
         review = await db.get_by_telegram_msg_id(parent_id) if parent_id else None
         if review:
-            await db.set_reply(review["id"], msg["text"])
-            if review["status"] == "pending":
-                await db.set_status(review["id"], "approved")
-            await _tg_call("sendMessage", {
-                "chat_id": CHISTOTAK_CHAT_ID,
-                "text": f"💬 Відповідь до відгуку #{review['id']} збережена й опублікована на сайті.",
-                "reply_to_message_id": msg["message_id"],
-            })
+            REJECT_WORDS = {"видалити", "приховати", "скасувати", "delete", "remove"}
+            if msg["text"].strip().lower() in REJECT_WORDS:
+                await db.set_status(review["id"], "rejected")
+                await _tg_call("sendMessage", {
+                    "chat_id": CHISTOTAK_CHAT_ID,
+                    "text": f"❌ Відгук #{review['id']} знятий з публікації.",
+                    "reply_to_message_id": msg["message_id"],
+                })
+            else:
+                await db.set_reply(review["id"], msg["text"])
+                if review["status"] == "pending":
+                    await db.set_status(review["id"], "approved")
+                await _tg_call("sendMessage", {
+                    "chat_id": CHISTOTAK_CHAT_ID,
+                    "text": f"💬 Відповідь до відгуку #{review['id']} збережена й опублікована на сайті.",
+                    "reply_to_message_id": msg["message_id"],
+                })
         return {"ok": True}
 
     return {"ok": True}

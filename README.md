@@ -48,7 +48,8 @@ out a full API map, including moderation endpoints, to anyone). Set
 1. Visitor submits a review on the site → stored `pending`, encrypted, rate-limited (max 3/hour per IP-hash) → notification lands in the ЧистоТак Telegram chat with **✅ Опублікувати / ❌ Відхилити** buttons.
 2. Tap a button → status updates in the DB, buttons disappear, message gets a status line. No web admin panel exists — nothing browser-facing to attack.
 3. To reply to a review: reply (Telegram's native Reply, not a new message) to that notification with your answer. The bot captures it, encrypts and stores it as the review's reply, and auto-approves the review if it was still pending.
-4. `GET /api/chistotak-reviews` only ever returns `approved` rows — `pending`/`rejected` never leave the DB via any public endpoint.
+4. To unpublish an already-approved review (no buttons left once tapped): reply to that same notification with one word — `видалити`, `приховати`, `скасувати`, `delete`, or `remove` — instead of a normal reply. Status flips to `rejected` and it drops off `GET /api/chistotak-reviews` immediately.
+5. `GET /api/chistotak-reviews` only ever returns `approved` rows — `pending`/`rejected` never leave the DB via any public endpoint.
 
 ## Threat model (why it's built this way)
 
