@@ -9,8 +9,17 @@ inline buttons.
 
 - `GET /` — service identity
 - `GET /health` — health probe
-- `POST /api/order` — Clean-Clean lead: `name`, `phone`, `city`, `service`, `details`, `page`
+- `POST /api/order` — Clean-Clean lead: `name`, `phone`, `city`, `service`, `details`, `page` (optional: `address`, `source`; honeypot `website`)
 - `POST /api/chistotak-order` — ЧистоТак lead, same shape, separate bot/chat
+
+### Lead delivery guarantees (both order endpoints)
+
+1. Lead is first saved to Postgres table `leads` (if `DATABASE_URL` + `REVIEWS_ENC_KEY` are set; name/phone/address/details are AES-GCM encrypted with the same key as reviews).
+2. Then it is sent to Telegram (`parse_mode=HTML`, every user value escaped; on a Telegram 400 it is re-sent as plain text).
+3. Response: `200 {"ok": true}` if the lead was saved **or** delivered. If Telegram failed but the lead is saved, the row keeps `delivered = false` — find undelivered leads with `SELECT id, site, created_at FROM leads WHERE NOT delivered ORDER BY created_at;`. `502 telegram_unavailable` only when it was neither saved nor delivered.
+4. Without `DATABASE_URL` the service works exactly as before (Telegram only).
+5. Anti-spam: max `LEAD_RATE_LIMIT` (default 5) leads per `LEAD_RATE_WINDOW_SEC` (default 600) per client IP, per endpoint → `429`. In-memory, per process. Client IP = first address of `X-Forwarded-For`, falling back to the socket peer.
+6. Logs never contain name/phone/address — only lead id, site and service.
 - `POST /api/chistotak-review` — submit a review: `name`, `rating` (1-5), `text`, `city`, `service`, `page`. No phone. Goes to `pending`, sent to Telegram with ✅/❌ buttons for moderation. 503 if the reviews DB isn't configured/reachable.
 - `GET /api/chistotak-reviews` — public: approved reviews only (`{reviews: [...]}`, empty list if DB unavailable — never errors)
 - `POST /telegram-webhook` — Telegram bot webhook (approve/reject buttons + reply-to-review capture). 404 unless `TELEGRAM_WEBHOOK_SECRET` is set and the request carries a matching `X-Telegram-Bot-Api-Secret-Token` header.
@@ -25,7 +34,8 @@ out a full API map, including moderation endpoints, to anyone). Set
 - `TELEGRAM_CHAT_ID` — destination chat id (user, group, or channel)
 - `CHISTOTAK_TELEGRAM_TOKEN` / `CHISTOTAK_TELEGRAM_CHAT_ID` — separate ЧистоТак bot/chat (falls back to the vars above if unset)
 - `ALLOWED_ORIGINS` — comma-separated origins for CORS (default: GitHub Pages site)
-- `TIKTOK_ACCESS_TOKEN` — **rotate this in TikTok Business Manager and set it here.** The old value used to be hardcoded in `app.py` in this (public) repo, so it must be treated as already leaked.
+- `TIKTOK_ACCESS_TOKEN` — **rotate this in TikTok Business Manager and set it here.** The old value used to be hardcoded in `app.py` in this (public) repo, so it must be treated as already leaked. There is no fallback any more: if the env var is missing, the server-side TikTok event is simply not sent (leads are unaffected).
+- `LEAD_RATE_LIMIT` / `LEAD_RATE_WINDOW_SEC` — optional, lead anti-spam (defaults 5 / 600).
 
 ### Reviews feature (all three required together, or the feature quietly disables itself — nothing else breaks)
 
@@ -66,6 +76,7 @@ out a full API map, including moderation endpoints, to anyone). Set
 ## Deploy on Render
 
 - Build: `pip install -r requirements.txt`
-- Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- Start (recommended): `uvicorn app:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'`
+  (the app reads `X-Forwarded-For` itself, so the old start command without these flags keeps working too)
 - Runtime: Python 3.12 (pinned in `runtime.txt`)
 - To enable reviews: attach a Postgres instance to this service in the Render dashboard (auto-sets `DATABASE_URL`), then add `REVIEWS_ENC_KEY`, `IP_HASH_SALT`, `TELEGRAM_WEBHOOK_SECRET` as env vars, redeploy, then run the `setWebhook` curl above once.

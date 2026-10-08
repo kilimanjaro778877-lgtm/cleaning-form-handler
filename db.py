@@ -1,5 +1,5 @@
 """
-Async Postgres шар для відгуків. Шифровані PII-поля (name, text, reply)
+Async Postgres шар для відгуків і заявок (таблиця leads). Шифровані PII-поля (name, text, reply)
 через crypto.py; усе інше — параметризовані запити (asyncpg $1,$2,...),
 НІКОЛИ f-string/format у SQL (захист від SQL-ін'єкції).
 
@@ -43,10 +43,35 @@ CREATE INDEX IF NOT EXISTS idx_reviews_site_status ON reviews (site, status, cre
 CREATE INDEX IF NOT EXISTS idx_reviews_msg_id ON reviews (telegram_msg_id);
 """
 
+# Заявки (обидва сайти). ПД (ім'я, телефон, адреса, деталі) — лише шифровані
+# (той самий crypto.py/REVIEWS_ENC_KEY). delivered=false -> заявка збережена, але
+# в Telegram не дійшла: її можна дослати вручну (SELECT ... WHERE NOT delivered).
+LEADS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS leads (
+    id BIGSERIAL PRIMARY KEY,
+    site TEXT NOT NULL,
+    name_enc TEXT NOT NULL DEFAULT '',
+    phone_enc TEXT NOT NULL DEFAULT '',
+    address_enc TEXT NOT NULL DEFAULT '',
+    details_enc TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    service TEXT NOT NULL DEFAULT '',
+    page TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    ip_hash TEXT NOT NULL DEFAULT '',
+    delivered BOOLEAN NOT NULL DEFAULT false,
+    delivered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_leads_undelivered ON leads (created_at) WHERE NOT delivered;
+"""
+
+_leads_ready = False
+
 
 async def init_pool() -> bool:
     """Best-effort: якщо DATABASE_URL не задано або конект впав — не валимо весь сервіс."""
-    global _pool
+    global _pool, _leads_ready
     if not DATABASE_URL:
         return False
     try:
@@ -55,10 +80,62 @@ async def init_pool() -> bool:
         )
         async with _pool.acquire() as conn:
             await conn.execute(SCHEMA)
-        return True
     except Exception:  # noqa: BLE001 — не валимо весь застосунок через БД
         _pool = None
         return False
+    # Окремо від відгуків: якщо з таблицею заявок щось не так — відгуки
+    # (і відправка заявок у Telegram) працюють як раніше.
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(LEADS_SCHEMA)
+        _leads_ready = True
+    except Exception:  # noqa: BLE001
+        _leads_ready = False
+    return True
+
+
+def leads_ready() -> bool:
+    return _pool is not None and _leads_ready
+
+
+def hash_ip_optional(ip: str) -> str:
+    """Як hash_ip(), але без винятку: без IP_HASH_SALT просто не зберігаємо IP."""
+    try:
+        return hash_ip(ip) if ip else ""
+    except RuntimeError:
+        return ""
+
+
+async def insert_lead(
+    *, site: str, name: str, phone: str, address: str, details: str,
+    city: str, service: str, page: str, source: str, ip_hash: str,
+) -> int:
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO leads (site, name_enc, phone_enc, address_enc, details_enc,
+                               city, service, page, source, ip_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
+            """,
+            site, encrypt(name), encrypt(phone), encrypt(address), encrypt(details),
+            city, service, page, source, ip_hash,
+        )
+        return row["id"]
+
+
+async def set_lead_delivered(lead_id: int, delivered: bool) -> None:
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        await conn.execute(
+            """
+            UPDATE leads SET delivered = $1::boolean,
+                   delivered_at = CASE WHEN $1::boolean THEN now() ELSE NULL END
+            WHERE id = $2
+            """,
+            delivered, lead_id,
+        )
 
 
 async def close_pool() -> None:

@@ -6,22 +6,24 @@ Clean-Clean form handler — приймає заявки з сайту і шле
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import html
 import logging
 import os
 import re
 import secrets
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from html import escape as _esc
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import crypto
 import db
@@ -55,9 +57,13 @@ ALLOWED_ORIGINS = os.environ.get(
     "https://chisto-tak.com.ua,"
     "https://www.chisto-tak.com.ua,"
     "http://chisto-tak.com.ua,"
-    "http://www.chisto-tak.com.ua,"
-    "https://kilimanjaro778877-lgtm.github.io/chistotak-site",
+    "http://www.chisto-tak.com.ua",
 ).split(",")
+
+# Антиспам заявок: не більше LEAD_RATE_LIMIT заявок за LEAD_RATE_WINDOW_SEC
+# з одного IP, окремо для кожного ендпоінта (in-memory, на процес).
+LEAD_RATE_LIMIT = int(os.environ.get("LEAD_RATE_LIMIT", "5"))
+LEAD_RATE_WINDOW_SEC = int(os.environ.get("LEAD_RATE_WINDOW_SEC", "600"))
 
 
 # ── Logging ─────────────────────────────────────────────────────────────
@@ -67,6 +73,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("clean-form")
+# httpx на INFO пише кожен URL запиту — а в URL Telegram Bot API сидить токен бота.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _clean_origins(raw: list[str]) -> list[str]:
+    """Origin — це лише scheme://host[:port], без шляху. Записи зі шляхом
+    браузер ніколи не надішле, тож вони мертві — відкидаємо."""
+    out: list[str] = []
+    for item in raw:
+        o = item.strip().rstrip("/")
+        if not o:
+            continue
+        if re.fullmatch(r"https?://[^/\s]+", o):
+            out.append(o)
+        else:
+            log.warning("CORS: ignoring invalid origin entry %r", o)
+    return out
 
 
 # ── App ─────────────────────────────────────────────────────────────────
@@ -76,13 +99,18 @@ log = logging.getLogger("clean-form")
 # уже працюють у проді). Якщо щось не готове — ендпоінти відгуків 503,
 # решта сервісу (order-форми) продовжує працювати як і раніше.
 REVIEWS_ENABLED = False
+# Збереження заявок у Postgres: потрібні DATABASE_URL + REVIEWS_ENC_KEY (ПД
+# шифруються). Без них — працюємо як раніше: тільки Telegram.
+LEADS_DB_ENABLED = False
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    global REVIEWS_ENABLED
+    global REVIEWS_ENABLED, LEADS_DB_ENABLED
     db_ok = await db.init_pool()
     REVIEWS_ENABLED = db_ok and crypto.ready() and db.salt_ready()
+    LEADS_DB_ENABLED = db_ok and crypto.ready() and db.leads_ready()
+    log.info("leads DB storage: %s", "enabled" if LEADS_DB_ENABLED else "disabled")
     if db_ok and not REVIEWS_ENABLED:
         log.error(
             "reviews DB connected, but disabled: REVIEWS_ENC_KEY=%s IP_HASH_SALT=%s",
@@ -109,7 +137,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
+    allow_origins=_clean_origins(ALLOWED_ORIGINS),
     allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type"],
@@ -117,15 +145,37 @@ app.add_middleware(
 
 
 # ── Schema ──────────────────────────────────────────────────────────────
+# Задовгі текстові поля ОБРІЗАЄМО, а не відхиляємо з 422: інакше, наприклад,
+# URL сторінки з рекламними мітками (gclid/gbraid/utm_*) легко перевищує ліміт,
+# і заявка з платного трафіку губиться цілком.
+_TRUNCATE = {"name": 100, "city": 50, "service": 100, "details": 1000,
+             "page": 1000, "address": 300, "source": 50, "website": 200}
+
+
 class OrderForm(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     phone: str = Field(..., min_length=5, max_length=30)
     city: str = Field(..., max_length=50)
     service: str = Field(..., max_length=100)
     details: str = Field(default="", max_length=1000)
-    page: str = Field(default="", max_length=2000)
+    page: str = Field(default="", max_length=1000)
+    # ЧистоТак-форми надсилають адресу (input name="address") — раніше вона мовчки губилась
+    address: str = Field(default="", max_length=300)
+    # callback-popup.js надсилає source="popup-15s"
+    source: str = Field(default="", max_length=50)
     # honeypot — спам-боти заповнять, реальні люди ні
     website: str = Field(default="", max_length=200)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _truncate_long(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            for key, limit in _TRUNCATE.items():
+                v = data.get(key)
+                if isinstance(v, str) and len(v) > limit:
+                    data[key] = v[:limit]
+        return data
 
     @field_validator("phone")
     @classmethod
@@ -135,11 +185,6 @@ class OrderForm(BaseModel):
             raise ValueError("телефон занадто короткий")
         return cleaned
 
-    @field_validator("page")
-    @classmethod
-    def trim_page(cls, v: str) -> str:
-        return v[:500]
-
 
 class ReviewForm(BaseModel):
     """Відгук — без телефону (свідомо: не питаємо його на цій формі)."""
@@ -148,27 +193,33 @@ class ReviewForm(BaseModel):
     text: str = Field(..., min_length=1, max_length=1000)
     city: str = Field(default="", max_length=100)
     service: str = Field(default="", max_length=100)
-    page: str = Field(default="", max_length=200)
+    page: str = Field(default="", max_length=1000)
     website: str = Field(default="", max_length=200)  # honeypot
+
+    @model_validator(mode="before")
+    @classmethod
+    def _truncate_page(cls, data: Any) -> Any:
+        # URL з рекламними мітками може бути довгим — обрізаємо, а не 422
+        if isinstance(data, dict) and isinstance(data.get("page"), str) and len(data["page"]) > 1000:
+            data = {**data, "page": data["page"][:1000]}
+        return data
 
 
 # ── TikTok Events API ───────────────────────────────────────────────────
 # УВАГА: TIKTOK_ACCESS_TOKEN раніше був прямо в коді цього публічного репозиторію
 # (github.com/kilimanjaro778877-lgtm/cleaning-form-handler, private:false) — тобто
-# токен уже засвітився в git-історії. Перенесено в env var, але СТАРИЙ токен
-# (1dffcc6847eab618ce2e955be753f5dd17ef9264) треба ротувати в TikTok Business
-# Manager — сама заміна коду цього не скасовує, старе значення й далі читається
-# у git log будь-ким.
+# токен уже засвітився в git-історії. Старий токен треба ротувати в TikTok
+# Business Manager — сама заміна коду цього не скасовує.
+# Токен — ТІЛЬКИ з env. Немає env-var -> серверна подія просто не надсилається.
 TIKTOK_PIXEL_ID = os.environ.get("TIKTOK_PIXEL_ID", "D81IGJRC77UDUGTVEQ00")
-# Fallback на старе значення — щоб трекінг не зламався ДО того, як в Render
-# з'явиться env var TIKTOK_ACCESS_TOKEN. Після ротації токена в TikTok Business
-# Manager постав новий токен у Render і прибери цей fallback.
-TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "1dffcc6847eab618ce2e955be753f5dd17ef9264")
+TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API = "https://business-api.tiktok.com/open_api/v1.3/pixel/track/"
 
 
 async def send_tiktok_event(form: OrderForm, client_ip: str = "") -> None:
     """Send server-side SubmitForm event to TikTok Events API."""
+    if not TIKTOK_ACCESS_TOKEN:
+        return
     try:
         # Hash phone for privacy
         phone_hash = hashlib.sha256(
@@ -202,61 +253,190 @@ async def send_tiktok_event(form: OrderForm, client_ip: str = "") -> None:
         else:
             log.warning("TikTok event failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        log.warning("TikTok event error (non-critical): %s", exc)
+        log.warning("TikTok event error (non-critical): %s", type(exc).__name__)
+
+
+# ── Client IP (за проксі Render) ────────────────────────────────────────
+def get_client_ip(request: Request) -> str:
+    """Реальний IP відвідувача. Render (як і будь-який reverse proxy) ставить
+    X-Forwarded-For: "<client>, <proxy1>, ..." — беремо перший адрес.
+    Fallback — request.client.host (працює і з, і без --proxy-headers).
+    Застереження: перший адрес XFF клієнт може підставити сам, тож для
+    антиспаму це "мʼякий" ключ (захист від масового флуду, не від цільової атаки)."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first[:64]
+    return request.client.host if request.client else ""
+
+
+# ── Rate limit заявок (in-memory, sliding window) ───────────────────────
+_rate_buckets: dict[tuple[str, str], deque[float]] = {}
+
+
+def _rate_limited(scope: str, ip: str) -> bool:
+    """True -> ліміт перевищено (такий запит НЕ зараховується).
+    Памʼять: тримаємо лише мітки часу за останнє вікно; застарілі ключі чистимо."""
+    if LEAD_RATE_LIMIT <= 0 or not ip:
+        return False
+    now = time.monotonic()
+    cutoff = now - LEAD_RATE_WINDOW_SEC
+    if len(_rate_buckets) > 10_000:  # захист від роздування памʼяті
+        for k in [k for k, q in _rate_buckets.items() if not q or q[-1] < cutoff]:
+            del _rate_buckets[k]
+    q = _rate_buckets.setdefault((scope, ip), deque())
+    while q and q[0] < cutoff:
+        q.popleft()
+    if len(q) >= LEAD_RATE_LIMIT:
+        return True
+    q.append(now)
+    return False
 
 
 # ── Telegram ────────────────────────────────────────────────────────────
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+CHISTOTAK_API = f"https://api.telegram.org/bot{CHISTOTAK_TOKEN}/sendMessage"
 
 
-def format_message(form: OrderForm) -> str:
+def _e(value: str) -> str:
+    """Екранування користувацького значення для Telegram parse_mode=HTML."""
+    return html.escape(value or "", quote=True)
+
+
+def _page_line_html(page: str) -> str:
+    if re.match(r"^https?://", page, re.IGNORECASE):
+        label = page if len(page) <= 120 else page[:117] + "…"
+        return f'🔗 <b>Сторінка:</b> <a href="{_e(page)}">{_e(label)}</a>'
+    return f"🔗 <b>Сторінка:</b> {_e(page)}"
+
+
+def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None) -> tuple[str, str]:
+    """Повертає (html, plain). plain — запасний варіант без parse_mode,
+    якщо Telegram раптом відхилить HTML (400: can't parse entities / bad URL)."""
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-    lines = [
-        "🆕 <b>Нова заявка з сайту</b>",
+    h = [
+        f"🆕 <b>{_e(title)}</b>",
         "",
-        f"👤 <b>Імʼя:</b> {_esc(form.name)}",
-        f"📞 <b>Телефон:</b> <code>{_esc(form.phone)}</code>",
-        f"🏙 <b>Місто:</b> {_esc(form.city)}",
-        f"🧹 <b>Послуга:</b> {_esc(form.service)}",
+        f"👤 <b>Імʼя:</b> {_e(form.name)}",
+        f"📞 <b>Телефон:</b> <code>{_e(form.phone)}</code>",
+        f"🏙 <b>Місто:</b> {_e(form.city)}",
     ]
+    p = [f"🆕 {title}", "", f"👤 Імʼя: {form.name}", f"📞 Телефон: {form.phone}",
+         f"🏙 Місто: {form.city}"]
+    if form.address:
+        h.append(f"📍 <b>Адреса:</b> {_e(form.address)}")
+        p.append(f"📍 Адреса: {form.address}")
+    h.append(f"🧹 <b>Послуга:</b> {_e(form.service)}")
+    p.append(f"🧹 Послуга: {form.service}")
     if form.details:
-        lines.append(f"📝 <b>Деталі:</b> {_esc(form.details)}")
+        h.append(f"📝 <b>Деталі:</b> {_e(form.details)}")
+        p.append(f"📝 Деталі: {form.details}")
     if form.page:
-        lines.append(f"🔗 <b>Сторінка:</b> {_esc(form.page)}")
-    lines.append(f"🕐 <b>Час:</b> {now}")
-    return "\n".join(lines)
+        h.append(_page_line_html(form.page))
+        p.append(f"🔗 Сторінка: {form.page}")
+    h.append(f"🕐 <b>Час:</b> {now}")
+    p.append(f"🕐 Час: {now}")
+    if lead_id is not None:
+        h.append(f"🆔 <b>Заявка №</b>{lead_id}")
+        p.append(f"🆔 Заявка №{lead_id}")
+    return "\n".join(h), "\n".join(p)
 
 
-async def send_to_telegram(text: str) -> None:
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(TELEGRAM_API, json=payload)
-    if resp.status_code != 200:
-        log.error("Telegram error: %s %s", resp.status_code, resp.text)
+def format_message(form: OrderForm, lead_id: int | None = None) -> str:
+    return format_lead_message("Нова заявка з сайту", form, lead_id)[0]
+
+
+def format_chistotak_message(form: OrderForm, lead_id: int | None = None) -> str:
+    return format_lead_message("Нова заявка — ЧистоТак", form, lead_id)[0]
+
+
+async def _post_json(url: str, payload: dict[str, Any], timeout: float = 15) -> httpx.Response:
+    """Єдина точка виходу в мережу для Telegram (тести її підміняють)."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(url, json=payload)
+
+
+def _tg_error_desc(resp: httpx.Response) -> str:
+    """Опис помилки Telegram для логу — без тексту повідомлення (там ПД)."""
+    try:
+        return str(resp.json().get("description", ""))[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def send_lead_to_telegram(api_url: str, chat_id: str, html_text: str, plain_text: str) -> bool:
+    """True, якщо Telegram прийняв повідомлення. Ніколи не кидає виняток."""
+    try:
+        resp = await _post_json(api_url, {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML"})
+        if resp.status_code == 200:
+            return True
+        log.error("Telegram error: %s %s", resp.status_code, _tg_error_desc(resp))
+        if resp.status_code == 400:
+            # HTML не прийняли — пробуємо простим текстом, щоб заявка не загубилась
+            resp = await _post_json(api_url, {"chat_id": chat_id, "text": plain_text})
+            if resp.status_code == 200:
+                return True
+            log.error("Telegram plain-text fallback error: %s %s", resp.status_code, _tg_error_desc(resp))
+    except Exception as exc:  # noqa: BLE001 — мережеві помилки/таймаути
+        log.error("Telegram request failed: %s", type(exc).__name__)
+    return False
+
+
+# ── Обробка заявки (спільна для обох сайтів) ────────────────────────────
+async def _process_lead(
+    *, site: str, title: str, api_url: str, chat_id: str,
+    form: OrderForm, request: Request, tiktok: bool,
+) -> dict[str, Any]:
+    client_ip = get_client_ip(request)
+    if _rate_limited(site, client_ip):
+        log.warning("lead rate-limit hit: site=%s", site)
+        raise HTTPException(status_code=429, detail="too_many_requests")
+
+    # honeypot — якщо заповнено, тихо повертаємо OK без надсилання
+    if form.website:
+        log.warning("honeypot triggered: site=%s", site)
+        return {"ok": True}
+
+    # 1) Спершу зберігаємо в БД (якщо налаштована). Збій БД заявку не валить.
+    lead_id: int | None = None
+    if LEADS_DB_ENABLED:
+        try:
+            lead_id = await asyncio.wait_for(db.insert_lead(
+                site=site, name=form.name, phone=form.phone, address=form.address,
+                details=form.details, city=form.city, service=form.service,
+                page=form.page, source=form.source,
+                ip_hash=db.hash_ip_optional(client_ip),
+            ), timeout=8)
+        except Exception as exc:  # noqa: BLE001
+            log.error("lead DB save failed: site=%s err=%s", site, type(exc).__name__)
+
+    # 2) Telegram (+ серверна подія TikTok паралельно — як і раніше, лише для Clean-Clean)
+    html_text, plain_text = format_lead_message(title, form, lead_id)
+    if tiktok:
+        delivered, _ = await asyncio.gather(
+            send_lead_to_telegram(api_url, chat_id, html_text, plain_text),
+            send_tiktok_event(form, client_ip),
+        )
+    else:
+        delivered = await send_lead_to_telegram(api_url, chat_id, html_text, plain_text)
+
+    if lead_id is not None:
+        try:
+            await asyncio.wait_for(db.set_lead_delivered(lead_id, delivered), timeout=8)
+        except Exception as exc:  # noqa: BLE001
+            log.error("lead delivered-flag update failed: id=%s err=%s", lead_id, type(exc).__name__)
+
+    log.info(
+        "lead: id=%s site=%s service=%r saved=%s delivered=%s",
+        lead_id, site, form.service[:60], lead_id is not None, delivered,
+    )
+    if not delivered and lead_id is None:
+        # ні в БД, ні в Telegram — фронт має побачити помилку (і повторити)
         raise HTTPException(status_code=502, detail="telegram_unavailable")
-
-
-# ── ЧистоТак (шле в той самий Telegram, що й Clean-Clean) ───────────────
-def format_chistotak_message(form: OrderForm) -> str:
-    now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-    lines = [
-        "🆕 <b>Нова заявка — ЧистоТак</b>",
-        "",
-        f"👤 <b>Імʼя:</b> {_esc(form.name)}",
-        f"📞 <b>Телефон:</b> <code>{_esc(form.phone)}</code>",
-        f"🏙 <b>Місто:</b> {_esc(form.city)}",
-        f"🧹 <b>Послуга:</b> {_esc(form.service)}",
-    ]
-    if form.details:
-        lines.append(f"📝 <b>Деталі:</b> {_esc(form.details)}")
-    if form.page:
-        lines.append(f"🔗 <b>Сторінка:</b> {_esc(form.page)}")
-    lines.append(f"🕐 <b>Час:</b> {now}")
-    return "\n".join(lines)
+    if not delivered:
+        log.error("lead saved but NOT delivered to Telegram: id=%s site=%s", lead_id, site)
+    return {"ok": True}
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────
@@ -272,47 +452,20 @@ async def health() -> dict[str, str]:
 
 @app.post("/api/order")
 async def submit_order(form: OrderForm, request: Request) -> dict[str, Any]:
-    # honeypot — якщо заповнено, тихо повертаємо OK без надсилання
-    if form.website:
-        log.warning("honeypot triggered from %s", request.client.host if request.client else "?")
-        return {"ok": True}
-
-    log.info("New order: %s / %s / %s", form.name, form.phone, form.service)
-
-    client_ip = request.client.host if request.client else ""
-    text = format_message(form)
-
-    # Send Telegram + TikTok server event in parallel
-    import asyncio
-    await asyncio.gather(
-        send_to_telegram(text),
-        send_tiktok_event(form, client_ip),
+    return await _process_lead(
+        site="cleanclean", title="Нова заявка з сайту",
+        api_url=TELEGRAM_API, chat_id=TELEGRAM_CHAT_ID,
+        form=form, request=request, tiktok=True,
     )
-    return {"ok": True}
 
 
 @app.post("/api/chistotak-order")
 async def submit_chistotak_order(form: OrderForm, request: Request) -> dict[str, Any]:
-    if form.website:
-        return {"ok": True}
-
-    log.info("ЧистоТак order: %s / %s / %s", form.name, form.phone, form.service)
-    text = format_chistotak_message(form)
-
-    # Шлємо в окремий бот ЧистоТак
-    chistotak_api = f"https://api.telegram.org/bot{CHISTOTAK_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHISTOTAK_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(chistotak_api, json=payload)
-    if resp.status_code != 200:
-        log.error("ЧистоТак Telegram error: %s %s", resp.status_code, resp.text)
-        raise HTTPException(status_code=502, detail="telegram_unavailable")
-
-    return {"ok": True}
+    return await _process_lead(
+        site="chistotak", title="Нова заявка — ЧистоТак",
+        api_url=CHISTOTAK_API, chat_id=CHISTOTAK_CHAT_ID,
+        form=form, request=request, tiktok=False,
+    )
 
 
 # ── Відгуки (ЧистоТак) ────────────────────────────────────────────────────
@@ -321,28 +474,36 @@ _CHISTOTAK_API_BASE = f"https://api.telegram.org/bot{CHISTOTAK_TOKEN}"
 
 
 async def _tg_call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(f"{_CHISTOTAK_API_BASE}/{method}", json=payload)
+    """Виклик Bot API ЧистоТак. Ніколи не кидає виняток (збій Telegram не має
+    перетворюватись на 500 після того, як відгук уже збережено в БД)."""
+    try:
+        resp = await _post_json(f"{_CHISTOTAK_API_BASE}/{method}", payload)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Telegram %s request failed: %s", method, type(exc).__name__)
+        return {}
     if resp.status_code != 200:
-        log.error("Telegram %s error: %s %s", method, resp.status_code, resp.text[:300])
-    return resp.json() if resp.content else {}
+        log.error("Telegram %s error: %s %s", method, resp.status_code, _tg_error_desc(resp))
+    try:
+        return resp.json() if resp.content else {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _review_notify_text(review_id: int, form: ReviewForm) -> str:
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
     stars = "★" * form.rating + "☆" * (5 - form.rating)
     lines = [
-        f"💬 *Новий відгук #{review_id} — ЧистоТак*",
+        f"💬 <b>Новий відгук #{review_id} — ЧистоТак</b>",
         "",
-        f"👤 *Ім'я:* {form.name}",
+        f"👤 <b>Ім'я:</b> {_e(form.name)}",
         f"{stars}",
-        f"📝 {form.text}",
+        f"📝 {_e(form.text)}",
     ]
     if form.city:
-        lines.append(f"🏙 *Місто:* {form.city}")
+        lines.append(f"🏙 <b>Місто:</b> {_e(form.city)}")
     if form.service:
-        lines.append(f"🧹 *Послуга:* {form.service}")
-    lines.append(f"🕐 *Час:* {now}")
+        lines.append(f"🧹 <b>Послуга:</b> {_e(form.service)}")
+    lines.append(f"🕐 <b>Час:</b> {now}")
     lines.append("")
     lines.append("Кнопками нижче — опублікувати/відхилити. Щоб відповісти клієнту, надішли текст-відповідь у Reply на це повідомлення.")
     return "\n".join(lines)
@@ -365,7 +526,7 @@ async def submit_chistotak_review(form: ReviewForm, request: Request) -> dict[st
     if not REVIEWS_ENABLED:
         raise HTTPException(status_code=503, detail="reviews_unavailable")
 
-    client_ip = request.client.host if request.client else ""
+    client_ip = get_client_ip(request)
     ip_hash = db.hash_ip(client_ip)
 
     # Rate-limit: не більше 3 відгуків з одного IP за годину (анти-спам,
@@ -390,7 +551,7 @@ async def submit_chistotak_review(form: ReviewForm, request: Request) -> dict[st
     tg_resp = await _tg_call("sendMessage", {
         "chat_id": CHISTOTAK_CHAT_ID,
         "text": _review_notify_text(review_id, form),
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "reply_markup": _review_keyboard(review_id),
     })
     msg_id = (tg_resp.get("result") or {}).get("message_id")
@@ -458,12 +619,13 @@ async def telegram_webhook(
                 "message_id": msg["message_id"],
                 "reply_markup": {"inline_keyboard": []},
             })
+            # Telegram віддає msg.text без розмітки (plain) — тому екрануємо його цілком
             old_text = msg.get("text", "")
             await _tg_call("editMessageText", {
                 "chat_id": CHISTOTAK_CHAT_ID,
                 "message_id": msg["message_id"],
-                "text": f"{old_text}\n\n{note}",
-                "parse_mode": "Markdown",
+                "text": f"{_e(old_text)}\n\n{_e(note)}",
+                "parse_mode": "HTML",
             })
         return {"ok": True}
 
