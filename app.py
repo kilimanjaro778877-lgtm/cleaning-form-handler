@@ -15,6 +15,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
+from html import escape as _esc
 from typing import Any
 
 import httpx
@@ -122,7 +123,7 @@ class OrderForm(BaseModel):
     city: str = Field(..., max_length=50)
     service: str = Field(..., max_length=100)
     details: str = Field(default="", max_length=1000)
-    page: str = Field(default="", max_length=200)
+    page: str = Field(default="", max_length=2000)
     # honeypot — спам-боти заповнять, реальні люди ні
     website: str = Field(default="", max_length=200)
 
@@ -133,6 +134,11 @@ class OrderForm(BaseModel):
         if len(cleaned) < 5:
             raise ValueError("телефон занадто короткий")
         return cleaned
+
+    @field_validator("page")
+    @classmethod
+    def trim_page(cls, v: str) -> str:
+        return v[:500]
 
 
 class ReviewForm(BaseModel):
@@ -206,18 +212,18 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 def format_message(form: OrderForm) -> str:
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
     lines = [
-        "🆕 *Нова заявка з сайту*",
+        "🆕 <b>Нова заявка з сайту</b>",
         "",
-        f"👤 *Імʼя:* {form.name}",
-        f"📞 *Телефон:* `{form.phone}`",
-        f"🏙 *Місто:* {form.city}",
-        f"🧹 *Послуга:* {form.service}",
+        f"👤 <b>Імʼя:</b> {_esc(form.name)}",
+        f"📞 <b>Телефон:</b> <code>{_esc(form.phone)}</code>",
+        f"🏙 <b>Місто:</b> {_esc(form.city)}",
+        f"🧹 <b>Послуга:</b> {_esc(form.service)}",
     ]
     if form.details:
-        lines.append(f"📝 *Деталі:* {form.details}")
+        lines.append(f"📝 <b>Деталі:</b> {_esc(form.details)}")
     if form.page:
-        lines.append(f"🔗 *Сторінка:* {form.page}")
-    lines.append(f"🕐 *Час:* {now}")
+        lines.append(f"🔗 <b>Сторінка:</b> {_esc(form.page)}")
+    lines.append(f"🕐 <b>Час:</b> {now}")
     return "\n".join(lines)
 
 
@@ -225,7 +231,7 @@ async def send_to_telegram(text: str) -> None:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(TELEGRAM_API, json=payload)
@@ -238,18 +244,18 @@ async def send_to_telegram(text: str) -> None:
 def format_chistotak_message(form: OrderForm) -> str:
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
     lines = [
-        "🆕 *Нова заявка — ЧистоТак*",
+        "🆕 <b>Нова заявка — ЧистоТак</b>",
         "",
-        f"👤 *Імʼя:* {form.name}",
-        f"📞 *Телефон:* `{form.phone}`",
-        f"🏙 *Місто:* {form.city}",
-        f"🧹 *Послуга:* {form.service}",
+        f"👤 <b>Імʼя:</b> {_esc(form.name)}",
+        f"📞 <b>Телефон:</b> <code>{_esc(form.phone)}</code>",
+        f"🏙 <b>Місто:</b> {_esc(form.city)}",
+        f"🧹 <b>Послуга:</b> {_esc(form.service)}",
     ]
     if form.details:
-        lines.append(f"📝 *Деталі:* {form.details}")
+        lines.append(f"📝 <b>Деталі:</b> {_esc(form.details)}")
     if form.page:
-        lines.append(f"🔗 *Сторінка:* {form.page}")
-    lines.append(f"🕐 *Час:* {now}")
+        lines.append(f"🔗 <b>Сторінка:</b> {_esc(form.page)}")
+    lines.append(f"🕐 <b>Час:</b> {now}")
     return "\n".join(lines)
 
 
@@ -298,7 +304,7 @@ async def submit_chistotak_order(form: OrderForm, request: Request) -> dict[str,
     payload = {
         "chat_id": CHISTOTAK_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(chistotak_api, json=payload)
