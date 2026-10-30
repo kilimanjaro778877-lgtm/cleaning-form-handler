@@ -25,6 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+import antifraud
 import crypto
 import db
 
@@ -165,6 +166,9 @@ class OrderForm(BaseModel):
     source: str = Field(default="", max_length=50)
     # honeypot — спам-боти заповнять, реальні люди ні
     website: str = Field(default="", max_length=200)
+    # антифрод (лише ЧистоТак-фронт): мс від відкриття сторінки до відправки, к-сть дій людини
+    t_ms: int | None = Field(default=None, ge=0, le=10**9)
+    hi: int | None = Field(default=None, ge=0, le=10**7)
 
     @model_validator(mode="before")
     @classmethod
@@ -275,10 +279,11 @@ def get_client_ip(request: Request) -> str:
 _rate_buckets: dict[tuple[str, str], deque[float]] = {}
 
 
-def _rate_limited(scope: str, ip: str) -> bool:
+def _rate_limited(scope: str, ip: str, limit: int | None = None) -> bool:
     """True -> ліміт перевищено (такий запит НЕ зараховується).
     Памʼять: тримаємо лише мітки часу за останнє вікно; застарілі ключі чистимо."""
-    if LEAD_RATE_LIMIT <= 0 or not ip:
+    limit = LEAD_RATE_LIMIT if limit is None else limit
+    if limit <= 0 or not ip:
         return False
     now = time.monotonic()
     cutoff = now - LEAD_RATE_WINDOW_SEC
@@ -288,7 +293,7 @@ def _rate_limited(scope: str, ip: str) -> bool:
     q = _rate_buckets.setdefault((scope, ip), deque())
     while q and q[0] < cutoff:
         q.popleft()
-    if len(q) >= LEAD_RATE_LIMIT:
+    if len(q) >= limit:
         return True
     q.append(now)
     return False
@@ -311,18 +316,25 @@ def _page_line_html(page: str) -> str:
     return f"🔗 <b>Сторінка:</b> {_e(page)}"
 
 
-def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None) -> tuple[str, str]:
+def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
+                        verdict: dict | None = None, ip: str = "") -> tuple[str, str]:
     """Повертає (html, plain). plain — запасний варіант без parse_mode,
     якщо Telegram раптом відхилить HTML (400: can't parse entities / bad URL)."""
     now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-    h = [
+    warn_h: list[str] = []
+    warn_p: list[str] = []
+    if verdict and verdict.get("suspect"):
+        why = "; ".join(verdict.get("reasons", []))
+        warn_h = [f"⚠️ <b>ПІДОЗРІЛА ЗАЯВКА</b> — у рекламу не зараховано", f"<i>{_e(why)}</i>", ""]
+        warn_p = ["⚠️ ПІДОЗРІЛА ЗАЯВКА — у рекламу не зараховано", why, ""]
+    h = warn_h + [
         f"🆕 <b>{_e(title)}</b>",
         "",
         f"👤 <b>Імʼя:</b> {_e(form.name)}",
         f"📞 <b>Телефон:</b> <code>{_e(form.phone)}</code>",
         f"🏙 <b>Місто:</b> {_e(form.city)}",
     ]
-    p = [f"🆕 {title}", "", f"👤 Імʼя: {form.name}", f"📞 Телефон: {form.phone}",
+    p = warn_p + [f"🆕 {title}", "", f"👤 Імʼя: {form.name}", f"📞 Телефон: {form.phone}",
          f"🏙 Місто: {form.city}"]
     if form.address:
         h.append(f"📍 <b>Адреса:</b> {_e(form.address)}")
@@ -340,6 +352,9 @@ def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None)
     if lead_id is not None:
         h.append(f"🆔 <b>Заявка №</b>{lead_id}")
         p.append(f"🆔 Заявка №{lead_id}")
+    if verdict and verdict.get("suspect") and ip:
+        h.append(f"🌐 <b>IP:</b> <code>{_e(ip)}</code> (для виключень у Google Ads)")
+        p.append(f"🌐 IP: {ip} (для виключень у Google Ads)")
     return "\n".join(h), "\n".join(p)
 
 
@@ -384,19 +399,58 @@ async def send_lead_to_telegram(api_url: str, chat_id: str, html_text: str, plai
 
 
 # ── Обробка заявки (спільна для обох сайтів) ────────────────────────────
+GUARD = antifraud.Guard()
+
+
 async def _process_lead(
     *, site: str, title: str, api_url: str, chat_id: str,
     form: OrderForm, request: Request, tiktok: bool,
 ) -> dict[str, Any]:
     client_ip = get_client_ip(request)
-    if _rate_limited(site, client_ip):
-        log.warning("lead rate-limit hit: site=%s", site)
-        raise HTTPException(status_code=429, detail="too_many_requests")
 
     # honeypot — якщо заповнено, тихо повертаємо OK без надсилання
     if form.website:
         log.warning("honeypot triggered: site=%s", site)
-        return {"ok": True}
+        return {"ok": True, "q": "suspect"}
+
+    verdict = GUARD.assess(name=form.name, phone=form.phone, details=form.details,
+                           address=form.address, t_ms=form.t_ms, hi=form.hi, ip=client_ip)
+    quality = ("blocked" if verdict["blocked"] else "suspect" if verdict["suspect"] else "ok")
+    if verdict["reasons"]:
+        quality += ": " + "; ".join(verdict["reasons"])
+    q_resp = "suspect" if verdict["suspect"] else "ok"
+
+    # Ліміт частоти — окремо для нормальних і підозрілих заявок, щоб спам з IP
+    # не заважав живій людині зі спільного мобільного IP. Сміття понад ліміт — у «клоаку».
+    if verdict["suspect"]:
+        if _rate_limited(site + ":suspect", client_ip):
+            verdict["blocked"] = True
+            quality = "blocked: rate-limit; " + quality
+    elif _rate_limited(site, client_ip, limit=LEAD_RATE_LIMIT * 2 if LEAD_RATE_LIMIT > 0 else 0):
+        log.warning("lead rate-limit hit: site=%s", site)
+        raise HTTPException(status_code=429, detail="too_many_requests")
+
+    # «Клоака»: з цього IP за добу вже було кілька сміттєвих заявок — тихо відкидаємо наступні
+    if verdict["blocked"]:
+        log.warning("lead shadow-blocked: site=%s score=%s", site, verdict["score"])
+        if LEADS_DB_ENABLED:
+            try:
+                await asyncio.wait_for(db.insert_lead(
+                    site=site, name=form.name, phone=form.phone, address=form.address,
+                    details=form.details, city=form.city, service=form.service,
+                    page=form.page, source=form.source,
+                    ip_hash=db.hash_ip_optional(client_ip), quality=quality,
+                ), timeout=8)
+            except Exception as exc:  # noqa: BLE001
+                log.error("blocked lead DB save failed: err=%s", type(exc).__name__)
+        if verdict["notify_block"]:
+            note_h = (f"🚫 <b>Спам-заявки з IP</b> <code>{_e(client_ip)}</code> — "
+                      f"{verdict['ip_suspects']} підозрілих за добу. Наступні сміттєві з нього "
+                      f"більше не надсилаю (збережено в базі). Додайте IP у виключення Google Ads.")
+            note_p = (f"🚫 Спам-заявки з IP {client_ip} — {verdict['ip_suspects']} підозрілих за добу. "
+                      f"Наступні сміттєві з нього більше не надсилаю. Додайте IP у виключення Google Ads.")
+            await send_lead_to_telegram(api_url, chat_id, note_h, note_p)
+        return {"ok": True, "q": "suspect"}
 
     # 1) Спершу зберігаємо в БД (якщо налаштована). Збій БД заявку не валить.
     lead_id: int | None = None
@@ -406,14 +460,14 @@ async def _process_lead(
                 site=site, name=form.name, phone=form.phone, address=form.address,
                 details=form.details, city=form.city, service=form.service,
                 page=form.page, source=form.source,
-                ip_hash=db.hash_ip_optional(client_ip),
+                ip_hash=db.hash_ip_optional(client_ip), quality=quality,
             ), timeout=8)
         except Exception as exc:  # noqa: BLE001
             log.error("lead DB save failed: site=%s err=%s", site, type(exc).__name__)
 
     # 2) Telegram (+ серверна подія TikTok паралельно — як і раніше, лише для Clean-Clean)
-    html_text, plain_text = format_lead_message(title, form, lead_id)
-    if tiktok:
+    html_text, plain_text = format_lead_message(title, form, lead_id, verdict, client_ip)
+    if tiktok and not verdict["suspect"]:
         delivered, _ = await asyncio.gather(
             send_lead_to_telegram(api_url, chat_id, html_text, plain_text),
             send_tiktok_event(form, client_ip),
@@ -431,12 +485,14 @@ async def _process_lead(
         "lead: id=%s site=%s service=%r saved=%s delivered=%s",
         lead_id, site, form.service[:60], lead_id is not None, delivered,
     )
+    if verdict["suspect"]:
+        log.warning("lead suspect: id=%s site=%s score=%s", lead_id, site, verdict["score"])
     if not delivered and lead_id is None:
         # ні в БД, ні в Telegram — фронт має побачити помилку (і повторити)
         raise HTTPException(status_code=502, detail="telegram_unavailable")
     if not delivered:
         log.error("lead saved but NOT delivered to Telegram: id=%s site=%s", lead_id, site)
-    return {"ok": True}
+    return {"ok": True, "q": q_resp}
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────

@@ -133,6 +133,7 @@ def _isolate(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "send", _blocked)
     app_module._rate_buckets.clear()
+    monkeypatch.setattr(app_module, "GUARD", app_module.antifraud.Guard())
     monkeypatch.setattr(app_module, "LEADS_DB_ENABLED", False)
     monkeypatch.setattr(app_module, "REVIEWS_ENABLED", False)
     monkeypatch.setattr(db, "_pool", None)
@@ -181,7 +182,7 @@ def lead(**over):
 def test_chistotak_order_success_contract(client, tg):
     r = client.post(CT_URL, json=lead())
     assert r.status_code == 200
-    assert r.json() == {"ok": True}  # фронти ЧистоТак перевіряють resp.ok
+    assert r.json()["ok"] is True  # фронти ЧистоТак перевіряють resp.ok
     assert len(tg.calls) == 1
     url, payload = tg.calls[0]
     assert url == "https://api.telegram.org/botTEST-CT-TOKEN/sendMessage"
@@ -198,7 +199,7 @@ def test_cleanclean_order_success_contract(client, tg):
     r = client.post(CC_URL, json=payload)
     assert r.status_code == 200
     data = r.json()
-    assert data == {"ok": True}
+    assert data["ok"] is True
     assert data.get("ok") or data.get("stub")  # app.js: if (data.ok || data.stub)
     url, sent = tg.calls[0]
     assert url == "https://api.telegram.org/botTEST-CC-TOKEN/sendMessage"
@@ -215,7 +216,7 @@ def test_popup_payload_and_unknown_fields_accepted(client, tg):
         "page": "https://chisto-tak.com.ua/kyiv.html", "source": "popup-15s",
         "website": "", "furniture": "диван",
     })
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
 
 
 def test_long_ad_url_is_not_rejected(client, tg):
@@ -234,9 +235,9 @@ def test_validation_still_rejects_bad_phone(client, tg):
 
 def test_honeypot(client, tg, pool):
     r = client.post(CT_URL, json=lead(website="http://spam.example"))
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
     r = client.post(CC_URL, json=lead(website="spam"))
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
     assert tg.calls == []
     assert pool.rows == {}
 
@@ -280,7 +281,7 @@ def test_html_rejected_falls_back_to_plain_text(client, tg):
 # ── Збереження в БД + статус доставки ────────────────────────────────────
 def test_lead_saved_encrypted_and_marked_delivered(client, tg, pool):
     r = client.post(CT_URL, json=lead(), headers={"X-Forwarded-For": "5.6.7.8, 10.0.0.1"})
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
     assert len(pool.rows) == 1
     row = next(iter(pool.rows.values()))
     assert row["site"] == "chistotak"
@@ -300,7 +301,7 @@ def test_telegram_down_db_ok_returns_200_undelivered(client, tg, pool, endpoint)
     tg.statuses = [500]
     r = client.post(endpoint, json=lead())
     assert r.status_code == 200
-    assert r.json() == {"ok": True}
+    assert r.json()["ok"] is True
     row = next(iter(pool.rows.values()))
     assert row["delivered"] is False
 
@@ -336,18 +337,19 @@ def test_db_down_telegram_ok_returns_200(client, tg, pool):
 
 # ── Rate limit + X-Forwarded-For ─────────────────────────────────────────
 def test_rate_limit_429_per_endpoint(client, tg):
-    for _ in range(5):
+    # нормальні заявки: ліміт ×2 (10 за вікно), щоб не різати живих людей зі спільного IP
+    for _ in range(10):
         assert client.post(CT_URL, json=lead()).status_code == 200
     r = client.post(CT_URL, json=lead())
     assert r.status_code == 429
-    assert len(tg.calls) == 5
+    assert len(tg.calls) == 10
     # інший ендпоінт — окремий лічильник
     assert client.post(CC_URL, json=lead()).status_code == 200
 
 
 def test_rate_limit_uses_x_forwarded_for(client, tg):
     h1 = {"X-Forwarded-For": "1.1.1.1, 10.0.0.1"}
-    for _ in range(5):
+    for _ in range(10):
         assert client.post(CT_URL, json=lead(), headers=h1).status_code == 200
     assert client.post(CT_URL, json=lead(), headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 429
     # інший реальний клієнт за тим самим проксі — не блокується
@@ -447,7 +449,7 @@ def review(**over):
 def test_review_submit_html_and_real_ip(client, tg, reviews):
     r = client.post("/api/chistotak-review", json=review(),
                     headers={"X-Forwarded-For": "9.9.9.9, 10.0.0.1"})
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200 and r.json()["ok"] is True
     assert reviews["recent_ip_hash"] == db.hash_ip("9.9.9.9")  # реальний IP, не проксі
     url, sent = tg.calls[0]
     assert url == "https://api.telegram.org/botTEST-CT-TOKEN/sendMessage"

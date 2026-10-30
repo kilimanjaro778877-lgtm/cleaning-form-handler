@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS leads (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_leads_undelivered ON leads (created_at) WHERE NOT delivered;
+-- антифрод: ok | suspect | blocked (+ причини)
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS quality TEXT NOT NULL DEFAULT '';
 """
 
 _leads_ready = False
@@ -108,19 +110,19 @@ def hash_ip_optional(ip: str) -> str:
 
 async def insert_lead(
     *, site: str, name: str, phone: str, address: str, details: str,
-    city: str, service: str, page: str, source: str, ip_hash: str,
+    city: str, service: str, page: str, source: str, ip_hash: str, quality: str = '',
 ) -> int:
     assert _pool is not None
     async with _pool.acquire(timeout=5) as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO leads (site, name_enc, phone_enc, address_enc, details_enc,
-                               city, service, page, source, ip_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                               city, service, page, source, ip_hash, quality)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             """,
             site, encrypt(name), encrypt(phone), encrypt(address), encrypt(details),
-            city, service, page, source, ip_hash,
+            city, service, page, source, ip_hash, quality[:300],
         )
         return row["id"]
 
