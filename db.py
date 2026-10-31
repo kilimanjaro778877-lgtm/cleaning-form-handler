@@ -70,10 +70,28 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS quality TEXT NOT NULL DEFAULT '';
 
 _leads_ready = False
 
+# Онлайн-запис (див. booking.py). kind: lead | manual | block; block з slot_time='' — увесь день.
+BOOKINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS bookings (
+    id BIGSERIAL PRIMARY KEY,
+    site TEXT NOT NULL,
+    slot_date DATE NOT NULL,
+    slot_time TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK (kind IN ('lead','manual','block')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','confirmed','cancelled')),
+    lead_id BIGINT,
+    ip_hash TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings (site, slot_date) WHERE status <> 'cancelled';
+"""
+
+_bookings_ready = False
+
 
 async def init_pool() -> bool:
     """Best-effort: якщо DATABASE_URL не задано або конект впав — не валимо весь сервіс."""
-    global _pool, _leads_ready
+    global _pool, _leads_ready, _bookings_ready
     if not DATABASE_URL:
         return False
     try:
@@ -93,11 +111,144 @@ async def init_pool() -> bool:
         _leads_ready = True
     except Exception:  # noqa: BLE001
         _leads_ready = False
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(BOOKINGS_SCHEMA)
+        _bookings_ready = True
+    except Exception:  # noqa: BLE001
+        _bookings_ready = False
     return True
 
 
 def leads_ready() -> bool:
     return _pool is not None and _leads_ready
+
+
+def bookings_ready() -> bool:
+    return _pool is not None and _bookings_ready
+
+
+# ── Онлайн-запис ─────────────────────────────────────────────────────────
+async def booking_state(site: str, d_from, d_to) -> tuple[dict, set]:
+    """(taken, blocks): taken[(date, time)] = зайнято місць; blocks = {(date, time|'')}."""
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT slot_date, slot_time, kind, count(*) AS n FROM bookings
+            WHERE site = $1 AND status <> 'cancelled' AND slot_date BETWEEN $2 AND $3
+            GROUP BY slot_date, slot_time, kind
+            """,
+            site, d_from, d_to,
+        )
+    taken: dict = {}
+    blocks: set = set()
+    for r in rows:
+        key = (r["slot_date"], r["slot_time"])
+        if r["kind"] == "block":
+            blocks.add(key)
+        else:
+            taken[key] = taken.get(key, 0) + r["n"]
+    return taken, blocks
+
+
+async def hold_slot(*, site: str, d, t: str, capacity: int, kind: str = "lead",
+                    lead_id: int | None = None, ip_hash: str = "") -> int | None:
+    """Атомарно займає місце (advisory-lock на слот). None — слот повний або закритий."""
+    assert _pool is not None and kind in ("lead", "manual")
+    async with _pool.acquire(timeout=5) as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{site}|{d}|{t}")
+            blocked = await conn.fetchval(
+                """
+                SELECT count(*) FROM bookings WHERE site = $1 AND slot_date = $2 AND kind = 'block'
+                  AND status <> 'cancelled' AND slot_time IN ('', $3::text)
+                """,
+                site, d, t,
+            )
+            taken = await conn.fetchval(
+                """
+                SELECT count(*) FROM bookings WHERE site = $1 AND slot_date = $2 AND slot_time = $3
+                  AND kind IN ('lead','manual') AND status <> 'cancelled'
+                """,
+                site, d, t,
+            )
+            if blocked or taken >= capacity:
+                return None
+            return await conn.fetchval(
+                """
+                INSERT INTO bookings (site, slot_date, slot_time, kind, lead_id, ip_hash)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+                """,
+                site, d, t, kind, lead_id, ip_hash,
+            )
+
+
+async def ip_recent_holds(site: str, ip_hash: str, hours: int = 24) -> int:
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        return await conn.fetchval(
+            """
+            SELECT count(*) FROM bookings WHERE site = $1 AND ip_hash = $2 AND kind = 'lead'
+              AND created_at > now() - make_interval(hours => $3)
+            """,
+            site, ip_hash, hours,
+        )
+
+
+async def set_booking_status(booking_id: int, status: str) -> dict | None:
+    """Повертає {slot_date, slot_time, status_before} або None, якщо такого запису немає."""
+    assert status in ("active", "confirmed", "cancelled") and _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        r = await conn.fetchrow(
+            """
+            UPDATE bookings b SET status = $2 FROM (SELECT id, status FROM bookings WHERE id = $1) old
+            WHERE b.id = old.id RETURNING b.slot_date, b.slot_time, old.status AS before
+            """,
+            booking_id, status,
+        )
+    return dict(r) if r else None
+
+
+async def add_block(site: str, d, t: str) -> None:
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        await conn.execute(
+            "INSERT INTO bookings (site, slot_date, slot_time, kind) VALUES ($1, $2, $3, 'block')",
+            site, d, t,
+        )
+
+
+async def reopen(site: str, d, t: str, all_times: tuple[str, ...]) -> int:
+    """Знімає закриття й записи «по телефону» (lead-записи клієнтів не чіпає —
+    їх скасовують кнопкою під заявкою). t='' — увесь день. Якщо відкривають один
+    слот у закритому дні — день розбиваємо на закриті слоти, крім цього. Повертає к-сть знятих."""
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        async with conn.transaction():
+            day_blocked = await conn.fetchval(
+                """
+                SELECT count(*) FROM bookings WHERE site = $1 AND slot_date = $2 AND kind = 'block'
+                  AND slot_time = '' AND status <> 'cancelled'
+                """,
+                site, d,
+            )
+            res = await conn.execute(
+                """
+                UPDATE bookings SET status = 'cancelled'
+                WHERE site = $1 AND slot_date = $2 AND kind IN ('block','manual') AND status <> 'cancelled'
+                  AND ($3::text = '' OR slot_time IN ('', $3::text))
+                """,
+                site, d, t,
+            )
+            if t and day_blocked:
+                for other in all_times:
+                    if other != t:
+                        await conn.execute(
+                            "INSERT INTO bookings (site, slot_date, slot_time, kind) VALUES ($1, $2, $3, 'block')",
+                            site, d, other,
+                        )
+    return int(res.split()[-1]) if res else 0
 
 
 def hash_ip_optional(ip: str) -> str:

@@ -17,15 +17,15 @@ import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import antifraud
+import booking
 import crypto
 import db
 
@@ -103,12 +103,16 @@ REVIEWS_ENABLED = False
 # Збереження заявок у Postgres: потрібні DATABASE_URL + REVIEWS_ENC_KEY (ПД
 # шифруються). Без них — працюємо як раніше: тільки Telegram.
 LEADS_DB_ENABLED = False
+# Онлайн-запис (booking.py): потрібна лише БД (без ПД — шифрування не потрібне).
+BOOKING_ENABLED = False
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    global REVIEWS_ENABLED, LEADS_DB_ENABLED
+    global REVIEWS_ENABLED, LEADS_DB_ENABLED, BOOKING_ENABLED
     db_ok = await db.init_pool()
+    BOOKING_ENABLED = db_ok and db.bookings_ready()
+    log.info("booking: %s", "enabled" if BOOKING_ENABLED else "disabled")
     REVIEWS_ENABLED = db_ok and crypto.ready() and db.salt_ready()
     LEADS_DB_ENABLED = db_ok and crypto.ready() and db.leads_ready()
     log.info("leads DB storage: %s", "enabled" if LEADS_DB_ENABLED else "disabled")
@@ -150,7 +154,8 @@ app.add_middleware(
 # URL сторінки з рекламними мітками (gclid/gbraid/utm_*) легко перевищує ліміт,
 # і заявка з платного трафіку губиться цілком.
 _TRUNCATE = {"name": 100, "city": 50, "service": 100, "details": 1000,
-             "page": 1000, "address": 300, "source": 50, "website": 200}
+             "page": 1000, "address": 300, "source": 50, "website": 200,
+             "slot_date": 10, "slot_time": 5}
 
 
 class OrderForm(BaseModel):
@@ -169,6 +174,9 @@ class OrderForm(BaseModel):
     # антифрод (лише ЧистоТак-фронт): мс від відкриття сторінки до відправки, к-сть дій людини
     t_ms: int | None = Field(default=None, ge=0, le=10**9)
     hi: int | None = Field(default=None, ge=0, le=10**7)
+    # онлайн-запис: '2026-11-03' + '11:00' (необовʼязково)
+    slot_date: str = Field(default="", max_length=10)
+    slot_time: str = Field(default="", max_length=5)
 
     @model_validator(mode="before")
     @classmethod
@@ -317,10 +325,11 @@ def _page_line_html(page: str) -> str:
 
 
 def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
-                        verdict: dict | None = None, ip: str = "") -> tuple[str, str]:
+                        verdict: dict | None = None, ip: str = "",
+                        slot_line: tuple[str, str] = ("", "")) -> tuple[str, str]:
     """Повертає (html, plain). plain — запасний варіант без parse_mode,
     якщо Telegram раптом відхилить HTML (400: can't parse entities / bad URL)."""
-    now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    now = booking.now_kyiv().strftime("%d.%m.%Y %H:%M")
     warn_h: list[str] = []
     warn_p: list[str] = []
     if verdict and verdict.get("suspect"):
@@ -341,6 +350,9 @@ def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
         p.append(f"📍 Адреса: {form.address}")
     h.append(f"🧹 <b>Послуга:</b> {_e(form.service)}")
     p.append(f"🧹 Послуга: {form.service}")
+    if slot_line[0]:
+        h.append(slot_line[0])
+        p.append(slot_line[1])
     if form.details:
         h.append(f"📝 <b>Деталі:</b> {_e(form.details)}")
         p.append(f"📝 Деталі: {form.details}")
@@ -380,22 +392,74 @@ def _tg_error_desc(resp: httpx.Response) -> str:
         return ""
 
 
-async def send_lead_to_telegram(api_url: str, chat_id: str, html_text: str, plain_text: str) -> bool:
+async def send_lead_to_telegram(api_url: str, chat_id: str, html_text: str, plain_text: str,
+                                reply_markup: dict | None = None) -> bool:
     """True, якщо Telegram прийняв повідомлення. Ніколи не кидає виняток."""
+    extra = {"reply_markup": reply_markup} if reply_markup else {}
     try:
-        resp = await _post_json(api_url, {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML"})
+        resp = await _post_json(api_url, {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML", **extra})
         if resp.status_code == 200:
             return True
         log.error("Telegram error: %s %s", resp.status_code, _tg_error_desc(resp))
         if resp.status_code == 400:
             # HTML не прийняли — пробуємо простим текстом, щоб заявка не загубилась
-            resp = await _post_json(api_url, {"chat_id": chat_id, "text": plain_text})
+            resp = await _post_json(api_url, {"chat_id": chat_id, "text": plain_text, **extra})
             if resp.status_code == 200:
                 return True
             log.error("Telegram plain-text fallback error: %s %s", resp.status_code, _tg_error_desc(resp))
     except Exception as exc:  # noqa: BLE001 — мережеві помилки/таймаути
         log.error("Telegram request failed: %s", type(exc).__name__)
     return False
+
+
+# ── Онлайн-запис ─────────────────────────────────────────────────────────
+BOOKING_SITE = "chistotak"
+
+
+def _booking_keyboard(booking_id: int, confirmed: bool = False) -> dict[str, Any]:
+    row = [] if confirmed else [{"text": "✅ Підтвердити запис", "callback_data": f"bk_ok:{booking_id}"}]
+    row.append({"text": "❌ Скасувати запис", "callback_data": f"bk_no:{booking_id}"})
+    return {"inline_keyboard": [row]}
+
+
+async def _book_for_lead(form: OrderForm, lead_id: int | None, verdict: dict,
+                         client_ip: str) -> tuple[str, tuple[str, str], dict | None]:
+    """Бронює слот під заявку. Повертає (статус, (рядок html, рядок plain), клавіатура).
+    Будь-який збій тут НЕ валить заявку — лише позначає час як «бажаний»."""
+    parsed = booking.parse_form_slot(form.slot_date, form.slot_time)
+    if not parsed:
+        return "", ("", ""), None
+    d, t = parsed
+    label = booking.fmt_slot(d, t)
+
+    def wish(note: str = "") -> tuple[str, str]:
+        tail = f" ({note})" if note else ""
+        return (f"📅 <b>Бажаний час:</b> {_e(label)}{_e(tail)}", f"📅 Бажаний час: {label}{tail}")
+
+    if not booking.bookable(d, t, booking.now_kyiv()):
+        return "late", wish("вже недоступний — узгодьте інший"), None
+    if booking.is_lviv(form.city):
+        return "wish", wish("Львів — узгодьте з партнером"), None
+    if verdict.get("suspect"):
+        return "wish", wish("не бронюю — підозріла заявка"), None
+    if not BOOKING_ENABLED:
+        return "wish", wish(), None
+    ip_hash = db.hash_ip_optional(client_ip)
+    try:
+        if ip_hash and await asyncio.wait_for(
+                db.ip_recent_holds(BOOKING_SITE, ip_hash), timeout=5) >= booking.IP_HOLDS_PER_DAY:
+            return "wish", wish("не бронюю — забагато записів з цього IP"), None
+        bid = await asyncio.wait_for(db.hold_slot(
+            site=BOOKING_SITE, d=d, t=t, capacity=booking.CAPACITY,
+            lead_id=lead_id, ip_hash=ip_hash), timeout=8)
+    except Exception as exc:  # noqa: BLE001
+        log.error("booking hold failed: err=%s", type(exc).__name__)
+        return "wish", wish(), None
+    if bid is None:
+        return "full", wish("❌ слот уже зайнятий — запропонуйте інший час"), None
+    return ("held",
+            (f"📅 <b>Запис:</b> {_e(label)} — місце заброньовано", f"📅 Запис: {label} — місце заброньовано"),
+            _booking_keyboard(bid))
 
 
 # ── Обробка заявки (спільна для обох сайтів) ────────────────────────────
@@ -465,15 +529,20 @@ async def _process_lead(
         except Exception as exc:  # noqa: BLE001
             log.error("lead DB save failed: site=%s err=%s", site, type(exc).__name__)
 
-    # 2) Telegram (+ серверна подія TikTok паралельно — як і раніше, лише для Clean-Clean)
-    html_text, plain_text = format_lead_message(title, form, lead_id, verdict, client_ip)
+    # 2) Онлайн-запис (лише ЧистоТак): бронюємо слот, якщо клієнт обрав час
+    slot_status, slot_line, keyboard = ("", ("", ""), None)
+    if site == BOOKING_SITE:
+        slot_status, slot_line, keyboard = await _book_for_lead(form, lead_id, verdict, client_ip)
+
+    # 3) Telegram (+ серверна подія TikTok паралельно — як і раніше, лише для Clean-Clean)
+    html_text, plain_text = format_lead_message(title, form, lead_id, verdict, client_ip, slot_line)
     if tiktok and not verdict["suspect"]:
         delivered, _ = await asyncio.gather(
             send_lead_to_telegram(api_url, chat_id, html_text, plain_text),
             send_tiktok_event(form, client_ip),
         )
     else:
-        delivered = await send_lead_to_telegram(api_url, chat_id, html_text, plain_text)
+        delivered = await send_lead_to_telegram(api_url, chat_id, html_text, plain_text, keyboard)
 
     if lead_id is not None:
         try:
@@ -492,7 +561,10 @@ async def _process_lead(
         raise HTTPException(status_code=502, detail="telegram_unavailable")
     if not delivered:
         log.error("lead saved but NOT delivered to Telegram: id=%s site=%s", lead_id, site)
-    return {"ok": True, "q": q_resp}
+    out: dict[str, Any] = {"ok": True, "q": q_resp}
+    if slot_status:
+        out["slot"] = slot_status
+    return out
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────
@@ -524,6 +596,23 @@ async def submit_chistotak_order(form: OrderForm, request: Request) -> dict[str,
     )
 
 
+@app.get("/api/chistotak-slots")
+async def chistotak_slots(response: Response, city: str = "kyiv") -> dict[str, Any]:
+    """Календар запису на 14 днів. live=False — показуємо час як «бажаний», без лічильника місць
+    (Львів — партнер; або БД недоступна)."""
+    response.headers["Cache-Control"] = "no-store"
+    now = booking.now_kyiv()
+    days = booking.window(now)
+    if BOOKING_ENABLED and not booking.is_lviv(city):
+        try:
+            taken, blocks = await asyncio.wait_for(
+                db.booking_state(BOOKING_SITE, days[0], days[-1]), timeout=5)
+            return {"live": True, "days": booking.availability(days, taken, blocks, now)}
+        except Exception as exc:  # noqa: BLE001
+            log.error("booking state failed: err=%s", type(exc).__name__)
+    return {"live": False, "days": booking.availability(days, {}, set(), now)}
+
+
 # ── Відгуки (ЧистоТак) ────────────────────────────────────────────────────
 REVIEWS_SITE = "chistotak"
 _CHISTOTAK_API_BASE = f"https://api.telegram.org/bot{CHISTOTAK_TOKEN}"
@@ -546,7 +635,7 @@ async def _tg_call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _review_notify_text(review_id: int, form: ReviewForm) -> str:
-    now = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    now = booking.now_kyiv().strftime("%d.%m.%Y %H:%M")
     stars = "★" * form.rating + "☆" * (5 - form.rating)
     lines = [
         f"💬 <b>Новий відгук #{review_id} — ЧистоТак</b>",
@@ -640,12 +729,26 @@ async def telegram_webhook(
     ):
         raise HTTPException(status_code=404)
 
+    update = await request.json()
+
+    # Запис: збій БД не повинен давати 500 — інакше Telegram без кінця повторює той самий update
+    cq = update.get("callback_query")
+    msg = update.get("message")
+    try:
+        if cq and str(cq.get("data", "")).startswith("bk_"):
+            return await _booking_callback(cq)
+        if (msg and str(msg.get("text", "")).startswith("/")
+                and str((msg.get("chat") or {}).get("id")) == str(CHISTOTAK_CHAT_ID)):
+            return await _booking_command(msg)
+    except Exception as exc:  # noqa: BLE001
+        log.error("booking webhook failed: err=%s", type(exc).__name__)
+        await _bk_reply((msg or (cq or {}).get("message") or {}).get("message_id"),
+                        "⚠️ Не вдалося виконати дію із записом (помилка бази). Спробуйте ще раз за хвилину.")
+        return {"ok": True}
+
     if not REVIEWS_ENABLED:
         return {"ok": True}
 
-    update = await request.json()
-
-    cq = update.get("callback_query")
     if cq:
         data = cq.get("data", "")
         cq_id = cq.get("id")
@@ -709,4 +812,90 @@ async def telegram_webhook(
                 })
         return {"ok": True}
 
+    return {"ok": True}
+
+
+async def _bk_reply(msg_id: int | None, text: str) -> None:
+    payload: dict[str, Any] = {"chat_id": CHISTOTAK_CHAT_ID, "text": text}
+    if msg_id:
+        payload["reply_to_message_id"] = msg_id
+    await _tg_call("sendMessage", payload)
+
+
+async def _booking_callback(cq: dict) -> dict[str, Any]:
+    cq_id = cq.get("id")
+    msg = cq.get("message") or {}
+    if str((msg.get("chat") or {}).get("id")) != str(CHISTOTAK_CHAT_ID):
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id})
+        return {"ok": True}
+    if not BOOKING_ENABLED:
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Запис недоступний (немає БД)"})
+        return {"ok": True}
+    action, _, id_str = str(cq.get("data", "")).partition(":")
+    try:
+        booking_id = int(id_str)
+    except ValueError:
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Помилка id"})
+        return {"ok": True}
+    if action == "bk_ok":
+        r = await db.set_booking_status(booking_id, "confirmed")
+        note, kb = "✅ Запис підтверджено", _booking_keyboard(booking_id, confirmed=True)
+    elif action == "bk_no":
+        r = await db.set_booking_status(booking_id, "cancelled")
+        note, kb = "❌ Запис скасовано — місце звільнено", {"inline_keyboard": []}
+    else:
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id})
+        return {"ok": True}
+    if r is None:
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Запис не знайдено"})
+        return {"ok": True}
+    await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": note})
+    if msg.get("message_id"):
+        await _tg_call("editMessageReplyMarkup", {
+            "chat_id": CHISTOTAK_CHAT_ID, "message_id": msg["message_id"], "reply_markup": kb,
+        })
+    await _bk_reply(msg.get("message_id"), f"{note}: {booking.fmt_slot(r['slot_date'], r['slot_time'])}")
+    return {"ok": True}
+
+
+async def _booking_command(msg: dict) -> dict[str, Any]:
+    now = booking.now_kyiv()
+    try:
+        cmd, d, t = booking.parse_command(msg.get("text", ""), now)
+    except booking.CmdError as exc:
+        await _bk_reply(msg.get("message_id"), f"⚠️ {exc}")
+        return {"ok": True}
+    if not cmd:
+        return {"ok": True}
+    if cmd in ("help", "start"):
+        await _bk_reply(msg.get("message_id"), booking.HELP)
+        return {"ok": True}
+    if not BOOKING_ENABLED:
+        await _bk_reply(msg.get("message_id"), "⚠️ Запис недоступний: немає підключення до бази.")
+        return {"ok": True}
+    days = booking.window(now)
+    if cmd == "slots":
+        taken, blocks = await db.booking_state(BOOKING_SITE, days[0], days[-1])
+        await _bk_reply(msg.get("message_id"), booking.slots_report(days, taken, blocks, now))
+        return {"ok": True}
+    assert d is not None
+    if d < now.date():
+        await _bk_reply(msg.get("message_id"), "⚠️ Ця дата вже минула.")
+        return {"ok": True}
+    label = booking.fmt_slot(d, t)
+    if cmd == "book":
+        bid = await db.hold_slot(site=BOOKING_SITE, d=d, t=t, capacity=booking.CAPACITY, kind="manual")
+        if bid is None:
+            text = f"❌ {label}: слот повний або закритий."
+        else:
+            taken, blocks = await db.booking_state(BOOKING_SITE, d, d)
+            free = booking.CAPACITY - taken.get((d, t), 0)
+            text = f"✅ Записано по телефону: {label}. Вільних місць лишилось: {max(0, free)}."
+    elif cmd == "close":
+        await db.add_block(BOOKING_SITE, d, t)
+        text = f"⛔ Закрито: {label if t else label + ' (увесь день)'}. На сайті цей час більше не пропонується."
+    else:  # open
+        n = await db.reopen(BOOKING_SITE, d, t, booking.TIMES)
+        text = f"✅ Відкрито: {label if t else label + ' (увесь день)'}. Знято закриттів/записів по телефону: {n}."
+    await _bk_reply(msg.get("message_id"), text)
     return {"ok": True}
