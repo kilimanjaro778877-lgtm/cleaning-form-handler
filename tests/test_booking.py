@@ -268,3 +268,38 @@ def test_webhook_db_failure_replies_not_500(client, tg, bk):
     r = _cmd(client, "/slots")
     assert r.status_code == 200
     assert "помилка бази" in _sent(tg)[-1]["text"]
+
+
+def test_db_watchdog_alerts_once_and_recovers(tg, monkeypatch):
+    import asyncio
+    states = iter([False, False, True])          # 1: впала, 2: досі лежить, 3: ожила
+    pings, inits = [], []
+
+    async def ping():
+        v = next(states); pings.append(v); return v
+
+    async def init_pool():
+        inits.append(1); return False
+
+    async def close_pool():
+        return None
+
+    calls = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(_s):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(db, "ping", ping)
+    monkeypatch.setattr(db, "init_pool", init_pool)
+    monkeypatch.setattr(db, "close_pool", close_pool)
+    monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app_module._db_watchdog())
+    texts = [p["text"] for p in _sent(tg)]
+    assert len(texts) == 2                          # один алерт (не дублюється), одне «ожила»
+    assert "база даних не відповідає" in texts[0] and "знову працює" in texts[1]
+    assert len(inits) == 2                          # пробував перепідключитись, поки лежала

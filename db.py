@@ -306,12 +306,28 @@ async def set_lead_delivered(lead_id: int, delivered: bool) -> None:
 
 
 async def close_pool() -> None:
+    global _pool
     if _pool is not None:
-        await _pool.close()
+        try:
+            await _pool.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _pool = None
 
 
 def available() -> bool:
     return _pool is not None
+
+
+async def ping() -> bool:
+    """Чи відповідає БД (для сторожа в app.py). Ніколи не кидає виняток."""
+    if _pool is None:
+        return False
+    try:
+        async with _pool.acquire(timeout=5) as conn:
+            return await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=5) == 1
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def salt_ready() -> bool:

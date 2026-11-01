@@ -107,14 +107,54 @@ LEADS_DB_ENABLED = False
 BOOKING_ENABLED = False
 
 
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):
+def _apply_db_flags(db_ok: bool) -> None:
     global REVIEWS_ENABLED, LEADS_DB_ENABLED, BOOKING_ENABLED
-    db_ok = await db.init_pool()
     BOOKING_ENABLED = db_ok and db.bookings_ready()
-    log.info("booking: %s", "enabled" if BOOKING_ENABLED else "disabled")
     REVIEWS_ENABLED = db_ok and crypto.ready() and db.salt_ready()
     LEADS_DB_ENABLED = db_ok and crypto.ready() and db.leads_ready()
+
+
+async def _db_alert(text: str) -> None:
+    """Повідомлення в чат заявок ЧистоТак (токен — лише з env, у текст не потрапляє)."""
+    await send_lead_to_telegram(CHISTOTAK_API, CHISTOTAK_CHAT_ID, text, text)
+
+
+DB_WATCH_SEC = 300
+
+
+async def _db_watchdog() -> None:
+    """Кожні 5 хв: чи жива БД. Ні — пробуємо перепідключитись; не вийшло — один алерт
+    у Telegram (повтор не частіше ніж раз на 12 год); відновилась — повідомлення «✅»."""
+    alerted_at = 0.0
+    while True:
+        await asyncio.sleep(DB_WATCH_SEC)
+        try:
+            ok = await db.ping()
+            if not ok:
+                await db.close_pool()
+                ok = await db.init_pool()
+                _apply_db_flags(ok)
+                if ok:
+                    log.info("DB reconnected by watchdog")
+            if not ok and time.time() - alerted_at > 12 * 3600:
+                alerted_at = time.time()
+                await _db_alert("⚠️ ЧистоТак: база даних не відповідає. Заявки в Telegram ідуть, "
+                                "але онлайн-запис, відгуки й збереження заявок у базу тимчасово не працюють. "
+                                "Перевірте Render: chistotak-db.")
+            elif ok and alerted_at:
+                alerted_at = 0.0
+                await _db_alert("✅ ЧистоТак: база даних знову працює — запис і відгуки увімкнено.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — сторож ніколи не падає
+            log.error("db watchdog error: %s", type(exc).__name__)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    db_ok = await db.init_pool()
+    _apply_db_flags(db_ok)
+    log.info("booking: %s", "enabled" if BOOKING_ENABLED else "disabled")
     log.info("leads DB storage: %s", "enabled" if LEADS_DB_ENABLED else "disabled")
     if db_ok and not REVIEWS_ENABLED:
         log.error(
@@ -123,7 +163,10 @@ async def _lifespan(_app: FastAPI):
             "ok" if db.salt_ready() else "MISSING",
         )
     log.info("reviews feature: %s", "enabled" if REVIEWS_ENABLED else "disabled")
+    watchdog = asyncio.create_task(_db_watchdog()) if db.DATABASE_URL else None
     yield
+    if watchdog:
+        watchdog.cancel()
     await db.close_pool()
 
 
