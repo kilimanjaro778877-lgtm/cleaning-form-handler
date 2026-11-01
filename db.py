@@ -10,7 +10,9 @@ Async Postgres шар для відгуків і заявок (таблиця le
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import os
 from typing import Any
 
@@ -21,6 +23,7 @@ from crypto import encrypt, decrypt
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 _pool: asyncpg.Pool | None = None
+log = logging.getLogger("clean-form")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -94,14 +97,25 @@ async def init_pool() -> bool:
     global _pool, _leads_ready, _bookings_ready
     if not DATABASE_URL:
         return False
-    try:
-        _pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=1, max_size=5, ssl="require", command_timeout=10
-        )
-        async with _pool.acquire() as conn:
-            await conn.execute(SCHEMA)
-    except Exception:  # noqa: BLE001 — не валимо весь застосунок через БД
-        _pool = None
+    # Кілька спроб: після рестарту/створення бази вона може відповісти не одразу
+    # (так 2026-11-01 сервіс піднявся без БД і мовчки працював без неї)
+    for attempt, delay in enumerate((0, 3, 6, 12), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            _pool = await asyncpg.create_pool(
+                DATABASE_URL, min_size=1, max_size=5, ssl="require", command_timeout=10
+            )
+            async with _pool.acquire() as conn:
+                await conn.execute(SCHEMA)
+            break
+        except Exception as exc:  # noqa: BLE001 — не валимо весь застосунок через БД
+            # лише тип помилки: текст asyncpg може містити хост/користувача
+            log.error("DB connect attempt %d failed: %s", attempt, type(exc).__name__)
+            if _pool is not None:
+                await _pool.close()
+            _pool = None
+    if _pool is None:
         return False
     # Окремо від відгуків: якщо з таблицею заявок щось не так — відгуки
     # (і відправка заявок у Telegram) працюють як раніше.
