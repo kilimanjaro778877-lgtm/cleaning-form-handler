@@ -578,6 +578,13 @@ async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
+@app.get("/health/features")
+async def health_features() -> dict[str, bool]:
+    """Які фічі увімкнулись при старті (лише так/ні, без деталей конфігу)."""
+    return {"db": db.available(), "leads_db": LEADS_DB_ENABLED,
+            "reviews": REVIEWS_ENABLED, "booking": BOOKING_ENABLED}
+
+
 @app.post("/api/order")
 async def submit_order(form: OrderForm, request: Request) -> dict[str, Any]:
     return await _process_lead(

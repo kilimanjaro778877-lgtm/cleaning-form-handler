@@ -519,3 +519,9 @@ def test_review_long_ad_url_is_trimmed_not_422(client):
     long_page = "https://chisto-tak.com.ua/vidguky.html?gad_source=1&gclid=" + "x" * 1500
     r = client.post("/api/chistotak-review", json={"name": "Іра", "rating": 5, "text": "Супер", "page": long_page})
     assert r.status_code != 422
+
+
+def test_health_features_flags_only(client):
+    j = client.get("/health/features").json()
+    assert set(j) == {"db", "leads_db", "reviews", "booking"}
+    assert all(isinstance(v, bool) for v in j.values())
