@@ -193,6 +193,18 @@ def test_chistotak_order_success_contract(client, tg):
     assert "<code>+380671234567</code>" in payload["text"]
 
 
+def test_site_total_shown_in_telegram(client, tg):
+    """Сума з калькулятора сайту — окремим рядком, щоб менеджер назвав ту саму ціну."""
+    r = client.post(CT_URL, json=lead(total="7 600 ₴ — калькулятор 7 000 ₴ + Духовка 600 ₴"))
+    assert r.status_code == 200
+    text = tg.calls[0][1]["text"]
+    assert "💰 <b>Сума на сайті:</b> 7 600 ₴ — калькулятор 7 000 ₴ + Духовка 600 ₴" in text
+    # без суми рядка немає (попап, старі сторінки з кешу)
+    tg.calls.clear()
+    client.post(CT_URL, json=lead(phone="0501112233"))
+    assert "Сума на сайті" not in tg.calls[0][1]["text"]
+
+
 def test_cleanclean_order_success_contract(client, tg):
     payload = lead(page="https://clean-clean.com.ua/kyiv.html")
     payload.pop("address")

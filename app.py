@@ -198,7 +198,7 @@ app.add_middleware(
 # і заявка з платного трафіку губиться цілком.
 _TRUNCATE = {"name": 100, "city": 50, "service": 100, "details": 1000,
              "page": 1000, "address": 300, "source": 50, "website": 200,
-             "slot_date": 10, "slot_time": 5}
+             "slot_date": 10, "slot_time": 5, "total": 200}
 
 
 class OrderForm(BaseModel):
@@ -220,6 +220,8 @@ class OrderForm(BaseModel):
     # онлайн-запис: '2026-11-03' + '11:00' (необовʼязково)
     slot_date: str = Field(default="", max_length=10)
     slot_time: str = Field(default="", max_length=5)
+    # сума, яку клієнт бачив у калькуляторі сайту (рядок від ct-lead.js): «7 600 ₴ — калькулятор …»
+    total: str = Field(default="", max_length=200)
 
     @model_validator(mode="before")
     @classmethod
@@ -393,6 +395,9 @@ def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
         p.append(f"📍 Адреса: {form.address}")
     h.append(f"🧹 <b>Послуга:</b> {_e(form.service)}")
     p.append(f"🧹 Послуга: {form.service}")
+    if form.total:
+        h.append(f"💰 <b>Сума на сайті:</b> {_e(form.total)}")
+        p.append(f"💰 Сума на сайті: {form.total}")
     if slot_line[0]:
         h.append(slot_line[0])
         p.append(slot_line[1])
@@ -411,6 +416,13 @@ def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
         h.append(f"🌐 <b>IP:</b> <code>{_e(ip)}</code> (для виключень у Google Ads)")
         p.append(f"🌐 IP: {ip} (для виключень у Google Ads)")
     return "\n".join(h), "\n".join(p)
+
+
+def _details_for_db(form: OrderForm) -> str:
+    """У БД сума з сайту зберігається разом із деталями (окремої колонки немає)."""
+    if not form.total:
+        return form.details
+    return (form.details + "\n" if form.details else "") + "Сума на сайті: " + form.total
 
 
 def format_message(form: OrderForm, lead_id: int | None = None) -> str:
@@ -544,7 +556,7 @@ async def _process_lead(
             try:
                 await asyncio.wait_for(db.insert_lead(
                     site=site, name=form.name, phone=form.phone, address=form.address,
-                    details=form.details, city=form.city, service=form.service,
+                    details=_details_for_db(form), city=form.city, service=form.service,
                     page=form.page, source=form.source,
                     ip_hash=db.hash_ip_optional(client_ip), quality=quality,
                 ), timeout=8)
@@ -565,7 +577,7 @@ async def _process_lead(
         try:
             lead_id = await asyncio.wait_for(db.insert_lead(
                 site=site, name=form.name, phone=form.phone, address=form.address,
-                details=form.details, city=form.city, service=form.service,
+                details=_details_for_db(form), city=form.city, service=form.service,
                 page=form.page, source=form.source,
                 ip_hash=db.hash_ip_optional(client_ip), quality=quality,
             ), timeout=8)
