@@ -150,6 +150,60 @@ async def _db_watchdog() -> None:
             log.error("db watchdog error: %s", type(exc).__name__)
 
 
+ARTICLE_FEED = "https://chisto-tak.com.ua/feed.xml"
+ARTICLE_WATCH_SEC = 15 * 60
+_ITEM_RE = re.compile(r"<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>", re.S)
+
+
+def _article_message(title: str, url: str) -> tuple[str, dict]:
+    """Нова стаття блогу → у чат заявок, з кнопками для подачі на індексацію."""
+    from urllib.parse import quote
+    text = (f"📰 <b>Нова стаття на сайті</b>\n{_e(title)}\n{_e(url)}\n\n"
+            "Подайте на індексацію: Search Console → «Перевірка URL» → вставити посилання → "
+            "«Надіслати запит на індексування».")
+    gsc = "https://search.google.com/search-console/inspect?resource_id={}&id=" + quote(url, safe="")
+    kb = {"inline_keyboard": [
+        [{"text": "🔍 Search Console (ресурс-домен)", "url": gsc.format("sc-domain%3Achisto-tak.com.ua")}],
+        [{"text": "🔍 Search Console (ресурс https://)", "url": gsc.format(quote("https://chisto-tak.com.ua/", safe=""))}],
+        [{"text": "Відкрити статтю", "url": url}],
+    ]}
+    return text, kb
+
+
+async def _article_check_once() -> int:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(ARTICLE_FEED, headers={"Cache-Control": "no-cache"})
+    if r.status_code != 200:
+        return 0
+    items = [(html.unescape(t).strip(), html.unescape(u).strip()) for t, u in _ITEM_RE.findall(r.text)]
+    items = [(t, u) for t, u in items if u.startswith("https://chisto-tak.com.ua/blog/")]
+    if not items:
+        return 0
+    fresh = set(await db.new_articles([u for _, u in items]))
+    sent = 0
+    for title, url in items:
+        if url in fresh:
+            text, kb = _article_message(title, url)
+            await send_lead_to_telegram(CHISTOTAK_API, CHISTOTAK_CHAT_ID, text, text, reply_markup=kb)
+            sent += 1
+    return sent
+
+
+async def _article_watch() -> None:
+    """Кожні 15 хв дивиться RSS блогу; нова стаття (зранку її публікує рутина) — посилання в бот,
+    щоб одразу подати на індексацію. Рутина сама в Telegram достукатись не може (мережа хмари)."""
+    while True:
+        await asyncio.sleep(60 if not db.bookings_ready() else ARTICLE_WATCH_SEC)
+        if not db.bookings_ready():
+            continue
+        try:
+            await _article_check_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("article watch error: %s", type(exc).__name__)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     db_ok = await db.init_pool()
@@ -164,9 +218,11 @@ async def _lifespan(_app: FastAPI):
         )
     log.info("reviews feature: %s", "enabled" if REVIEWS_ENABLED else "disabled")
     watchdog = asyncio.create_task(_db_watchdog()) if db.DATABASE_URL else None
+    articles = asyncio.create_task(_article_watch()) if db.DATABASE_URL and CHISTOTAK_CHAT_ID else None
     yield
-    if watchdog:
-        watchdog.cancel()
+    for task in (watchdog, articles):
+        if task:
+            task.cancel()
     await db.close_pool()
 
 
@@ -198,7 +254,8 @@ app.add_middleware(
 # і заявка з платного трафіку губиться цілком.
 _TRUNCATE = {"name": 100, "city": 50, "service": 100, "details": 1000,
              "page": 1000, "address": 300, "source": 50, "website": 200,
-             "slot_date": 10, "slot_time": 5, "total": 200}
+             "slot_date": 10, "slot_time": 5, "total": 200,
+             "landing": 1000}
 
 
 class OrderForm(BaseModel):
@@ -222,6 +279,8 @@ class OrderForm(BaseModel):
     slot_time: str = Field(default="", max_length=5)
     # сума, яку клієнт бачив у калькуляторі сайту (рядок від ct-lead.js): «7 600 ₴ — калькулятор …»
     total: str = Field(default="", max_length=200)
+    # перша сторінка візиту з мітками реклами (gclid / fbclid / utm…) — ct-lead.js
+    landing: str = Field(default="", max_length=1000)
 
     @model_validator(mode="before")
     @classmethod
@@ -369,6 +428,23 @@ def _page_line_html(page: str) -> str:
     return f"🔗 <b>Сторінка:</b> {_e(page)}"
 
 
+_AD_MARKS = (("gclid", "Google Ads"), ("gbraid", "Google Ads"), ("wbraid", "Google Ads"),
+             ("fbclid", "Meta (Facebook / Instagram)"), ("ttclid", "TikTok"))
+
+
+def ad_source(page: str, landing: str) -> str:
+    """Звідки людина: за мітками в URL сторінки або першої сторінки візиту."""
+    from urllib.parse import parse_qs, urlsplit
+    for url in (landing, page):
+        q = parse_qs(urlsplit(url or "").query)
+        for key, name in _AD_MARKS:
+            if q.get(key):
+                return name
+        if q.get("utm_source"):
+            return "utm: " + q["utm_source"][0][:40]
+    return "без міток реклами (пошук / прямий захід / реклама з минулих візитів)"
+
+
 def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
                         verdict: dict | None = None, ip: str = "",
                         slot_line: tuple[str, str] = ("", "")) -> tuple[str, str]:
@@ -404,6 +480,10 @@ def format_lead_message(title: str, form: OrderForm, lead_id: int | None = None,
     if form.details:
         h.append(f"📝 <b>Деталі:</b> {_e(form.details)}")
         p.append(f"📝 Деталі: {form.details}")
+    if form.page or form.landing:
+        src = ad_source(form.page, form.landing)
+        h.append(f"📣 <b>Джерело:</b> {_e(src)}")
+        p.append(f"📣 Джерело: {src}")
     if form.page:
         h.append(_page_line_html(form.page))
         p.append(f"🔗 Сторінка: {form.page}")

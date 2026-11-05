@@ -224,6 +224,27 @@ async def set_booking_status(booking_id: int, status: str) -> dict | None:
     return dict(r) if r else None
 
 
+ARTICLES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS notified_articles (
+    url        TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+async def new_articles(urls: list[str]) -> list[str]:
+    """Позначає статті як «надіслані» і повертає ті, яких раніше не було.
+    Перший запуск (таблиця порожня) — лише запамʼятовує наявні, нічого не повертає."""
+    assert _pool is not None
+    async with _pool.acquire(timeout=5) as conn:
+        await conn.execute(ARTICLES_SCHEMA)
+        first = not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM notified_articles)")
+        fresh = await conn.fetch(
+            "INSERT INTO notified_articles (url) SELECT unnest($1::text[]) "
+            "ON CONFLICT DO NOTHING RETURNING url", urls)
+    return [] if first else [r["url"] for r in fresh]
+
+
 async def add_block(site: str, d, t: str) -> None:
     assert _pool is not None
     async with _pool.acquire(timeout=5) as conn:

@@ -205,6 +205,23 @@ def test_site_total_shown_in_telegram(client, tg):
     assert "Сума на сайті" not in tg.calls[0][1]["text"]
 
 
+def test_ad_source_line(client, tg):
+    """Джерело заявки: мітка Google Ads з першої сторінки візиту, навіть якщо форма на іншій."""
+    client.post(CT_URL, json=lead(page="https://chisto-tak.com.ua/faq.html",
+                                  landing="https://chisto-tak.com.ua/?gclid=abc123"))
+    assert "📣 <b>Джерело:</b> Google Ads" in tg.calls[0][1]["text"]
+    assert app_module.ad_source("https://chisto-tak.com.ua/?fbclid=x", "").startswith("Meta")
+    assert app_module.ad_source("https://chisto-tak.com.ua/", "").startswith("без міток")
+
+
+def test_new_article_message_has_gsc_buttons():
+    text, kb = app_module._article_message("Тест", "https://chisto-tak.com.ua/blog/test.html")
+    assert "https://chisto-tak.com.ua/blog/test.html" in text
+    urls = [b[0]["url"] for b in kb["inline_keyboard"]]
+    assert "sc-domain%3Achisto-tak.com.ua" in urls[0]
+    assert "id=https%3A%2F%2Fchisto-tak.com.ua%2Fblog%2Ftest.html" in urls[0]
+
+
 def test_cleanclean_order_success_contract(client, tg):
     payload = lead(page="https://clean-clean.com.ua/kyiv.html")
     payload.pop("address")
