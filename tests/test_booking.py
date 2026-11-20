@@ -177,7 +177,9 @@ def test_capacity_two_then_full_but_lead_never_lost(client, tg, bk):
                     headers={"X-Forwarded-For": "10.0.0.9"})
     assert r.json() == {"ok": True, "q": "ok", "slot": "full"}
     last = _sent(tg)[-1]
-    assert "слот уже зайнятий" in last["text"] and "reply_markup" not in last
+    assert "слот уже зайнятий" in last["text"]
+    # слот не втримали — кнопок запису немає, лишається лише «Попросити відгук»
+    assert last["reply_markup"] == {"inline_keyboard": [[{"text": "⭐ Попросити відгук", "callback_data": "rv:uk"}]]}
     assert len(_sent(tg)) == 3 and _free(client) == 0
 
 
@@ -226,6 +228,7 @@ def test_cancel_button_frees_slot_confirm_keeps_cancel(client, tg, bk):
     client.post("/telegram-webhook", json=cq, headers=SECRET)
     kb = [p for u, p in tg.calls if u.endswith("/editMessageReplyMarkup")][-1]["reply_markup"]
     assert [b["callback_data"] for b in kb["inline_keyboard"][0]] == ["bk_no:1"]
+    assert kb["inline_keyboard"][1][0]["callback_data"] == "rv:uk"  # кнопка відгуку не зникає
     assert _free(client) == 1
     cq["callback_query"]["data"] = "bk_no:1"
     client.post("/telegram-webhook", json=cq, headers=SECRET)
@@ -303,3 +306,42 @@ def test_db_watchdog_alerts_once_and_recovers(tg, monkeypatch):
     assert len(texts) == 2                          # один алерт (не дублюється), одне «ожила»
     assert "база даних не відповідає" in texts[0] and "знову працює" in texts[1]
     assert len(inits) == 2                          # пробував перепідключитись, поки лежала
+
+
+# ── «⭐ Попросити відгук» ──────────────────────────────────────────────────
+def _rv(client, data="rv:uk", chat=222):
+    cq = {"callback_query": {"id": "c9", "data": data, "message": {"message_id": 77, "chat": {"id": chat}}}}
+    return client.post("/telegram-webhook", json=cq, headers=SECRET)
+
+
+def test_review_button_on_lead_without_slot_and_ru_page(client, tg, bk):
+    client.post(EP, json=lead(page="https://chisto-tak.com.ua/ru/kyiv.html", **HUMAN))
+    kb = _sent(tg)[-1]["reply_markup"]["inline_keyboard"]
+    assert kb == [[{"text": "⭐ Попросити відгук", "callback_data": "rv:ru"}]]
+
+
+def test_review_request_sends_ready_text(client, tg, bk, monkeypatch):
+    monkeypatch.setenv("GOOGLE_REVIEW_URL", "https://g.page/r/test/review")
+    _rv(client)
+    texts = [m["text"] for m in _sent(tg)]
+    assert texts[-2].startswith("👇 Перешліть") and texts[-1].endswith("https://g.page/r/test/review")
+    assert "Дякуємо, що обрали ЧистоТак" in texts[-1]
+    _rv(client, "rv:ru")
+    assert "Спасибо, что выбрали ЧистоТак" in _sent(tg)[-1]["text"]
+
+
+def test_review_request_without_link_explains(client, tg, bk, monkeypatch):
+    monkeypatch.delenv("GOOGLE_REVIEW_URL", raising=False)
+    import google_reviews
+    monkeypatch.setattr(google_reviews, "API_KEY", "")
+    n = len(_sent(tg))
+    _rv(client)
+    alert = [p for u, p in tg.calls if u.endswith("/answerCallbackQuery")][-1]
+    assert alert.get("show_alert") and "Places API" in alert["text"] and len(_sent(tg)) == n
+
+
+def test_review_request_from_foreign_chat_ignored(client, tg, bk, monkeypatch):
+    monkeypatch.setenv("GOOGLE_REVIEW_URL", "https://g.page/r/test/review")
+    n = len(_sent(tg))
+    _rv(client, chat=999)
+    assert len(_sent(tg)) == n

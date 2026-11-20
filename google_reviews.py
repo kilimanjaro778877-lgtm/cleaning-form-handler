@@ -82,6 +82,23 @@ def _shape(j: dict, place_id: str) -> dict:
     }
 
 
+async def write_url() -> str:
+    """Пряме посилання «залишити відгук» у Google. GOOGLE_REVIEW_URL (якщо задано) має пріоритет."""
+    manual = os.environ.get("GOOGLE_REVIEW_URL", "")
+    if manual:
+        return manual
+    if not enabled():
+        return ""
+    data = await get()
+    if data.get("ok"):
+        return data["write_url"]
+    try:
+        return f"https://search.google.com/local/writereview?placeid={await _place_id()}"
+    except Exception as exc:  # noqa: BLE001
+        log.error("google place lookup failed: %s", type(exc).__name__)
+        return ""
+
+
 async def get(now: float | None = None) -> dict:
     """Дані для сайту. Без ключа або без жодних даних — {"ok": False}, блок на сайті не показується."""
     now = time.time() if now is None else now

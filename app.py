@@ -552,10 +552,19 @@ async def send_lead_to_telegram(api_url: str, chat_id: str, html_text: str, plai
 BOOKING_SITE = "chistotak"
 
 
-def _booking_keyboard(booking_id: int, confirmed: bool = False) -> dict[str, Any]:
+def _review_row(lang: str = "uk") -> list[dict[str, str]]:
+    return [{"text": "⭐ Попросити відгук", "callback_data": f"rv:{'ru' if lang == 'ru' else 'uk'}"}]
+
+
+def _booking_keyboard(booking_id: int, confirmed: bool = False, lang: str = "uk") -> dict[str, Any]:
     row = [] if confirmed else [{"text": "✅ Підтвердити запис", "callback_data": f"bk_ok:{booking_id}"}]
     row.append({"text": "❌ Скасувати запис", "callback_data": f"bk_no:{booking_id}"})
-    return {"inline_keyboard": [row]}
+    return {"inline_keyboard": [row, _review_row(lang)]}
+
+
+def _lead_lang(form: "OrderForm") -> str:
+    """Мова клієнта — за сторінкою, з якої прийшла заявка (/ru/ — російська версія сайту)."""
+    return "ru" if "/ru/" in (form.page or "") else "uk"
 
 
 async def _book_for_lead(form: OrderForm, lead_id: int | None, verdict: dict,
@@ -595,7 +604,7 @@ async def _book_for_lead(form: OrderForm, lead_id: int | None, verdict: dict,
         return "full", wish("❌ слот уже зайнятий — запропонуйте інший час"), None
     return ("held",
             (f"📅 <b>Запис:</b> {_e(label)} — місце заброньовано", f"📅 Запис: {label} — місце заброньовано"),
-            _booking_keyboard(bid))
+            _booking_keyboard(bid, lang=_lead_lang(form)))
 
 
 # ── Обробка заявки (спільна для обох сайтів) ────────────────────────────
@@ -672,6 +681,8 @@ async def _process_lead(
 
     # 3) Telegram (+ серверна подія TikTok паралельно — як і раніше, лише для Clean-Clean)
     html_text, plain_text = format_lead_message(title, form, lead_id, verdict, client_ip, slot_line)
+    if site == BOOKING_SITE and keyboard is None and not verdict["suspect"]:
+        keyboard = {"inline_keyboard": [_review_row(_lead_lang(form))]}
     if tiktok and not verdict["suspect"]:
         delivered, _ = await asyncio.gather(
             send_lead_to_telegram(api_url, chat_id, html_text, plain_text),
@@ -888,6 +899,8 @@ async def telegram_webhook(
     try:
         if cq and str(cq.get("data", "")).startswith("bk_"):
             return await _booking_callback(cq)
+        if cq and str(cq.get("data", "")).startswith("rv:"):
+            return await _review_request_callback(cq)
         if (msg and str(msg.get("text", "")).startswith("/")
                 and str((msg.get("chat") or {}).get("id")) == str(CHISTOTAK_CHAT_ID)):
             return await _booking_command(msg)
@@ -966,6 +979,45 @@ async def telegram_webhook(
     return {"ok": True}
 
 
+REVIEW_ASK = {
+    "uk": ("Дякуємо, що обрали ЧистоТак! 🙏 Якщо вам сподобалось прибирання, залиште, будь ласка, "
+           "відгук у Google — це 30 секунд і дуже допоможе нашій команді:\n{url}"),
+    "ru": ("Спасибо, что выбрали ЧистоТак! 🙏 Если вам понравилась уборка, оставьте, пожалуйста, "
+           "отзыв в Google — это 30 секунд и очень поможет нашей команде:\n{url}"),
+}
+
+
+def _kb_lang(msg: dict) -> str:
+    """Мова кнопки відгуку, що вже стоїть під повідомленням (щоб не загубити її при редагуванні)."""
+    for row in ((msg.get("reply_markup") or {}).get("inline_keyboard") or []):
+        for b in row:
+            if str(b.get("callback_data", "")) == "rv:ru":
+                return "ru"
+    return "uk"
+
+
+async def _review_request_callback(cq: dict) -> dict[str, Any]:
+    """«⭐ Попросити відгук»: окреме повідомлення з текстом для клієнта — його просто переслати."""
+    cq_id = cq.get("id")
+    msg = cq.get("message") or {}
+    if str((msg.get("chat") or {}).get("id")) != str(CHISTOTAK_CHAT_ID):
+        await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id})
+        return {"ok": True}
+    url = await google_reviews.write_url()
+    if not url:
+        await _tg_call("answerCallbackQuery", {
+            "callback_query_id": cq_id, "show_alert": True,
+            "text": "Посилання на відгук ще не готове: у Google Cloud увімкніть Places API (New) "
+                    "для ключа сайту. Після цього кнопка запрацює сама."})
+        return {"ok": True}
+    lang = "ru" if str(cq.get("data", "")).endswith(":ru") else "uk"
+    await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Готово — перешліть клієнту"})
+    await _bk_reply(msg.get("message_id"), "👇 Перешліть наступне повідомлення клієнту (Viber / Telegram / SMS):")
+    await _tg_call("sendMessage", {"chat_id": CHISTOTAK_CHAT_ID, "text": REVIEW_ASK[lang].format(url=url),
+                                   "disable_web_page_preview": True})
+    return {"ok": True}
+
+
 async def _bk_reply(msg_id: int | None, text: str) -> None:
     payload: dict[str, Any] = {"chat_id": CHISTOTAK_CHAT_ID, "text": text}
     if msg_id:
@@ -988,12 +1040,13 @@ async def _booking_callback(cq: dict) -> dict[str, Any]:
     except ValueError:
         await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id, "text": "Помилка id"})
         return {"ok": True}
+    lang = _kb_lang(msg)
     if action == "bk_ok":
         r = await db.set_booking_status(booking_id, "confirmed")
-        note, kb = "✅ Запис підтверджено", _booking_keyboard(booking_id, confirmed=True)
+        note, kb = "✅ Запис підтверджено", _booking_keyboard(booking_id, confirmed=True, lang=lang)
     elif action == "bk_no":
         r = await db.set_booking_status(booking_id, "cancelled")
-        note, kb = "❌ Запис скасовано — місце звільнено", {"inline_keyboard": []}
+        note, kb = "❌ Запис скасовано — місце звільнено", {"inline_keyboard": [_review_row(lang)]}
     else:
         await _tg_call("answerCallbackQuery", {"callback_query_id": cq_id})
         return {"ok": True}
