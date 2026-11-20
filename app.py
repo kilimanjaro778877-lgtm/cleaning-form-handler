@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 import antifraud
 import booking
 import crypto
+import google_reviews
 import db
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -846,6 +847,14 @@ async def submit_chistotak_review(form: ReviewForm, request: Request) -> dict[st
         await db.set_telegram_msg_id(review_id, msg_id)
 
     return {"ok": True}
+
+
+@app.get("/api/google-reviews")
+async def google_reviews_api(response: Response) -> dict[str, Any]:
+    """Рейтинг і відгуки з Google-профілю для блоку на сайті (кеш на сервері 12 год)."""
+    data = await google_reviews.get()
+    response.headers["Cache-Control"] = "public, max-age=3600" if data.get("ok") else "no-store"
+    return data
 
 
 @app.get("/api/chistotak-reviews")
